@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Board, Move, MoveKind, PieceType, evaluation};
+use crate::{Board, Color, Move, MoveKind, PieceType, evaluation};
 
 mod tt;
 
@@ -15,6 +15,7 @@ pub const DEFAULT_HASH_MB: usize = 16;
 pub const MIN_HASH_MB: usize = 1;
 pub const MAX_HASH_MB: usize = 65_536;
 const INFINITY: i32 = 32_000;
+const HISTORY_MAX: i32 = 16_384;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SearchLimits {
@@ -115,6 +116,32 @@ impl SearchContext<'_> {
 struct SearchState<'a> {
     context: SearchContext<'a>,
     table: TranspositionTable,
+    history: ButterflyHistory,
+}
+
+struct ButterflyHistory {
+    scores: [[[i32; 64]; 64]; 2],
+}
+
+impl Default for ButterflyHistory {
+    fn default() -> Self {
+        Self {
+            scores: [[[0; 64]; 64]; 2],
+        }
+    }
+}
+
+impl ButterflyHistory {
+    fn score(&self, color: Color, mv: Move) -> i32 {
+        self.scores[color.index()][mv.from().index()][mv.to().index()]
+    }
+
+    fn reward(&mut self, color: Color, mv: Move, depth: u8) {
+        let depth = i32::from(depth);
+        let bonus = (depth * depth).min(HISTORY_MAX);
+        let entry = &mut self.scores[color.index()][mv.from().index()][mv.to().index()];
+        *entry += bonus - *entry * bonus / HISTORY_MAX;
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -145,6 +172,7 @@ pub fn iterative_deepening(
             nodes: 0,
         },
         table,
+        history: ButterflyHistory::default(),
     };
     let mut outcome = SearchOutcome {
         best_move: fallback,
@@ -227,7 +255,13 @@ fn negamax(
     }
     let alpha_start = alpha;
 
-    order_moves(board, &mut moves, entry.and_then(|stored| stored.best_move));
+    let side_to_move = board.side_to_move();
+    order_moves(
+        board,
+        &mut moves,
+        entry.and_then(|stored| stored.best_move),
+        &search.history,
+    );
 
     let mut best = -INFINITY;
     let mut best_move = None;
@@ -249,6 +283,9 @@ fn negamax(
             pv.prepend(mv, &child_pv);
         }
         if alpha >= beta {
+            if is_quiet(board, mv) {
+                search.history.reward(side_to_move, mv, depth);
+            }
             break;
         }
     }
@@ -311,7 +348,12 @@ fn quiescence(
         moves.retain(|&mv| is_tactical(board, mv));
     }
 
-    order_moves(board, &mut moves, entry.and_then(|stored| stored.best_move));
+    order_moves(
+        board,
+        &mut moves,
+        entry.and_then(|stored| stored.best_move),
+        &search.history,
+    );
     for mv in moves {
         let undo = board
             .make_move_unchecked(mv)
@@ -348,6 +390,10 @@ fn is_tactical(board: &Board, mv: Move) -> bool {
     mv.promotion().is_some() || mvv_lva_score(board, mv) > 0
 }
 
+fn is_quiet(board: &Board, mv: Move) -> bool {
+    mv.promotion().is_none() && mvv_lva_score(board, mv) == 0
+}
+
 fn tt_cutoff(entry: Entry, depth: u8, ply: usize, alpha: i32, beta: i32) -> Option<i32> {
     if entry.depth < depth {
         return None;
@@ -371,8 +417,17 @@ fn classify_bound(score: i32, alpha: i32, beta: i32) -> Bound {
     }
 }
 
-fn order_moves(board: &Board, moves: &mut [Move], tt_move: Option<Move>) {
-    moves.sort_by_key(|&mv| std::cmp::Reverse((Some(mv) == tt_move, mvv_lva_score(board, mv))));
+fn order_moves(board: &Board, moves: &mut [Move], tt_move: Option<Move>, history: &ButterflyHistory) {
+    let color = board.side_to_move();
+    moves.sort_by_key(|&mv| {
+        let capture_score = mvv_lva_score(board, mv);
+        let history_score = if is_quiet(board, mv) {
+            history.score(color, mv)
+        } else {
+            0
+        };
+        std::cmp::Reverse((Some(mv) == tt_move, capture_score > 0, capture_score, history_score))
+    });
 }
 
 fn mvv_lva_score(board: &Board, mv: Move) -> i32 {
@@ -430,6 +485,7 @@ mod tests {
                 nodes: 0,
             },
             table: TranspositionTable::new(64 * 1024),
+            history: ButterflyHistory::default(),
         }
     }
 
@@ -478,6 +534,12 @@ mod tests {
         assert!(
             score > 50,
             "fail-soft search returned the beta bound instead of the score"
+        );
+        assert!(
+            search.history.scores[Color::White.index()]
+                .iter()
+                .flatten()
+                .any(|&score| score > 0)
         );
     }
 
@@ -567,12 +629,43 @@ mod tests {
         let quiet = Move::new("d1".parse().unwrap(), "d2".parse().unwrap());
         let mut moves = [quiet, queen_takes_rook, queen_takes_queen, pawn_takes_queen];
 
-        order_moves(&board, &mut moves, None);
+        let history = ButterflyHistory::default();
+        order_moves(&board, &mut moves, None, &history);
 
         assert_eq!(moves, [pawn_takes_queen, queen_takes_queen, queen_takes_rook, quiet]);
 
-        order_moves(&board, &mut moves, Some(quiet));
+        order_moves(&board, &mut moves, Some(quiet), &history);
         assert_eq!(moves, [quiet, pawn_takes_queen, queen_takes_queen, queen_takes_rook]);
+    }
+
+    #[test]
+    fn orders_rewarded_quiets_by_butterfly_history() {
+        let board = Board::starting_position();
+        let a3 = Move::new("a2".parse().unwrap(), "a3".parse().unwrap());
+        let nc3 = Move::new("b1".parse().unwrap(), "c3".parse().unwrap());
+        let mut history = ButterflyHistory::default();
+        history.reward(Color::White, nc3, 6);
+        let mut moves = [a3, nc3];
+
+        order_moves(&board, &mut moves, None, &history);
+
+        assert_eq!(moves, [nc3, a3]);
+    }
+
+    #[test]
+    fn captures_stay_ahead_of_high_history_quiets() {
+        let board = Board::from_fen("k7/8/8/3q4/4P3/8/8/K7 w - - 0 1").unwrap();
+        let capture = Move::new("e4".parse().unwrap(), "d5".parse().unwrap());
+        let quiet = Move::new("e4".parse().unwrap(), "e5".parse().unwrap());
+        let mut history = ButterflyHistory::default();
+        for _ in 0..1_000 {
+            history.reward(Color::White, quiet, 127);
+        }
+        let mut moves = [quiet, capture];
+
+        order_moves(&board, &mut moves, None, &history);
+
+        assert_eq!(moves, [capture, quiet]);
     }
 
     #[test]
