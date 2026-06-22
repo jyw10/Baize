@@ -36,8 +36,7 @@ Engine changes are measured against a fixed baseline with paired SPRT matches.
 
 ## License
 
-Baize is available under either the [MIT License](LICENSE-MIT) or
-[Apache License 2.0](LICENSE-APACHE), at your option.
+Baize is available under the [MIT License](LICENSE).
 
 [releases]: https://github.com/jyw10/Baize/releases
 [wiki]: https://github.com/jyw10/Baize/wiki
