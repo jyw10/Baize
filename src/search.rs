@@ -168,6 +168,10 @@ fn negamax(
     context: &mut SearchContext<'_>,
     pv: &mut PvLine,
 ) -> Result<i32, Aborted> {
+    if depth == 0 {
+        return quiescence(board, ply, alpha, beta, context, pv);
+    }
+
     context.enter_node()?;
     pv.len = 0;
 
@@ -182,7 +186,7 @@ fn negamax(
     if board.is_fifty_move_draw() || board.is_threefold_repetition() || board.is_insufficient_material() {
         return Ok(0);
     }
-    if depth == 0 || ply + 1 >= MAX_PLY {
+    if ply + 1 >= MAX_PLY {
         return Ok(evaluation::evaluate(board));
     }
 
@@ -211,6 +215,69 @@ fn negamax(
     }
 
     Ok(best)
+}
+
+fn quiescence(
+    board: &mut Board,
+    ply: usize,
+    mut alpha: i32,
+    beta: i32,
+    context: &mut SearchContext<'_>,
+    pv: &mut PvLine,
+) -> Result<i32, Aborted> {
+    context.enter_node()?;
+    pv.len = 0;
+
+    let in_check = board.is_in_check(board.side_to_move());
+    let mut moves = board.legal_moves();
+    if moves.is_empty() {
+        return Ok(if in_check { -MATE_SCORE + ply as i32 } else { 0 });
+    }
+    if board.is_fifty_move_draw() || board.is_threefold_repetition() || board.is_insufficient_material() {
+        return Ok(0);
+    }
+    if ply + 1 >= MAX_PLY {
+        return Ok(evaluation::evaluate(board));
+    }
+
+    let mut best = -INFINITY;
+    if !in_check {
+        let stand_pat = evaluation::evaluate(board);
+        best = stand_pat;
+        if stand_pat >= beta {
+            return Ok(stand_pat);
+        }
+        alpha = alpha.max(stand_pat);
+        moves.retain(|&mv| is_tactical(board, mv));
+    }
+
+    order_moves(board, &mut moves);
+    for mv in moves {
+        let undo = board
+            .make_move_unchecked(mv)
+            .expect("legal move must be structurally valid");
+        let mut child_pv = PvLine::default();
+        let child = quiescence(board, ply + 1, -beta, -alpha, context, &mut child_pv);
+        board.unmake_move(undo);
+        let score = -child?;
+
+        if score > best {
+            best = score;
+        }
+        if score > alpha {
+            alpha = score;
+            pv.prepend(mv, &child_pv);
+        }
+        if alpha >= beta {
+            break;
+        }
+    }
+
+    Ok(best)
+}
+
+fn is_tactical(board: &Board, mv: Move) -> bool {
+    mv.promotion().is_some() || mvv_lva_score(board, mv) > 0
 }
 
 fn order_moves(board: &Board, moves: &mut [Move]) {
@@ -262,6 +329,16 @@ mod tests {
 
     use super::*;
 
+    fn unlimited_context(stop: &AtomicBool) -> SearchContext<'_> {
+        SearchContext {
+            stop,
+            start: Instant::now(),
+            hard_time: None,
+            max_nodes: None,
+            nodes: 0,
+        }
+    }
+
     #[test]
     fn finds_mate_in_one() {
         let board = Board::from_fen("7k/5Q2/6K1/8/8/8/8/8 w - - 0 1").unwrap();
@@ -301,16 +378,68 @@ mod tests {
     fn fail_soft_returns_score_beyond_beta() {
         let mut board = Board::from_fen("4k3/8/8/8/8/8/4Q3/4K3 w - - 0 1").unwrap();
         let stop = AtomicBool::new(false);
-        let mut context = SearchContext {
-            stop: &stop,
-            start: Instant::now(),
-            hard_time: None,
-            max_nodes: None,
-            nodes: 0,
-        };
+        let mut context = unlimited_context(&stop);
         let mut pv = PvLine::default();
         let score = negamax(&mut board, 1, 0, -50, 50, &mut context, &mut pv).unwrap();
         assert_eq!(score, 900, "fail-soft search returned a bound instead of the score");
+    }
+
+    #[test]
+    fn quiescence_avoids_a_poisoned_capture_at_the_horizon() {
+        let board = Board::from_fen("3q3k/8/8/3r4/8/8/8/3Q3K w - - 0 1").unwrap();
+        let poisoned = Move::new("d1".parse().unwrap(), "d5".parse().unwrap());
+        let stop = AtomicBool::new(false);
+        let result = iterative_deepening(
+            &board,
+            SearchLimits {
+                depth: Some(1),
+                ..SearchLimits::default()
+            },
+            &stop,
+            |_| {},
+        );
+
+        assert_ne!(result.best_move, Some(poisoned));
+        assert_eq!(result.score, -500);
+    }
+
+    #[test]
+    fn quiescence_searches_quiet_promotions() {
+        let mut board = Board::from_fen("7k/P7/8/8/8/8/8/7K w - - 0 1").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut context = unlimited_context(&stop);
+        let mut pv = PvLine::default();
+
+        let score = quiescence(&mut board, 0, -INFINITY, INFINITY, &mut context, &mut pv).unwrap();
+
+        assert_eq!(score, 900);
+        assert_eq!(pv.moves[0].promotion(), Some(PieceType::Queen));
+    }
+
+    #[test]
+    fn quiescence_searches_all_legal_evasions_while_in_check() {
+        let mut board = Board::from_fen("4r1k1/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut context = unlimited_context(&stop);
+        let mut pv = PvLine::default();
+
+        let score = quiescence(&mut board, 0, -INFINITY, INFINITY, &mut context, &mut pv).unwrap();
+
+        assert_eq!(score, -500);
+        assert!(context.nodes > 1, "quiet check evasions were not searched");
+        assert_eq!(pv.len, 1);
+    }
+
+    #[test]
+    fn quiescence_stand_pat_cutoff_is_fail_soft() {
+        let mut board = Board::from_fen("4k3/8/8/8/8/8/4Q3/4K3 w - - 0 1").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut context = unlimited_context(&stop);
+        let mut pv = PvLine::default();
+
+        let score = quiescence(&mut board, 0, -50, 50, &mut context, &mut pv).unwrap();
+
+        assert_eq!(score, 900);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Baize
 
 Baize is an open-source competitive UCI chess engine written in Rust. The
-current development engine identifies itself as `Baize-v0.2.0`.
+current development engine identifies itself as `Baize-v0.3.0`.
 
 Baize does not include a graphical user interface. Use it with a UCI-compatible
 chess GUI or tournament manager.
@@ -12,11 +12,12 @@ chess GUI or tournament manager.
 - Fail-soft negamax with alpha-beta pruning
 - Iterative deepening with depth, node, clock, and move-time limits
 - MVV-LVA capture move ordering
+- Quiescence search over captures, promotions, and check evasions
 - Material evaluation
 - Asynchronous UCI `go`, `stop`, and `quit` handling
 
-Baize is under active development. It does not yet include quiescence search,
-a transposition table, or additional pruning heuristics.
+Baize is under active development. It does not yet include a transposition
+table or additional pruning heuristics.
 
 ## Getting started
 

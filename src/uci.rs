@@ -341,7 +341,7 @@ mod tests {
         engine.stop_search();
 
         let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
-        assert!(text.contains("id name Baize-v0.2.0\n"));
+        assert!(text.contains("id name Baize-v0.3.0\n"));
         assert!(text.contains("uciok\n"));
         assert!(text.contains("readyok\n"));
         assert!(text.contains("bestmove "));
