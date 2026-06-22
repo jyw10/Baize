@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     Board, Color, Move, MoveKind, PieceType, Square,
-    search::{SearchInfo, SearchLimits, iterative_deepening, mate_moves},
+    search::{DEFAULT_HASH_MB, MAX_HASH_MB, MIN_HASH_MB, SearchInfo, SearchLimits, iterative_deepening, mate_moves},
     time::{Clock, allocate_time, fixed_move_time},
 };
 
@@ -35,6 +35,7 @@ struct SearchHandle {
 
 struct UciEngine<W: Write + Send + 'static> {
     board: Board,
+    hash_size_mb: usize,
     output: Arc<Mutex<W>>,
     search: Option<SearchHandle>,
 }
@@ -43,6 +44,7 @@ impl<W: Write + Send + 'static> UciEngine<W> {
     fn new(output: Arc<Mutex<W>>) -> Self {
         Self {
             board: Board::default(),
+            hash_size_mb: DEFAULT_HASH_MB,
             output,
             search: None,
         }
@@ -59,6 +61,12 @@ impl<W: Write + Send + 'static> UciEngine<W> {
                     format_args!("id name Baize-v{}", env!("CARGO_PKG_VERSION")),
                 );
                 emit(&self.output, format_args!("id author Baize contributors"));
+                emit(
+                    &self.output,
+                    format_args!(
+                        "option name Hash type spin default {DEFAULT_HASH_MB} min {MIN_HASH_MB} max {MAX_HASH_MB}"
+                    ),
+                );
                 emit(&self.output, format_args!("uciok"));
             }
             "isready" => emit(&self.output, format_args!("readyok")),
@@ -78,10 +86,31 @@ impl<W: Write + Send + 'static> UciEngine<W> {
                 self.stop_search();
                 return false;
             }
-            "setoption" | "debug" | "register" | "ponderhit" => {}
+            "setoption" => {
+                self.stop_search();
+                self.set_option(command);
+            }
+            "debug" | "register" | "ponderhit" => {}
             _ => {}
         }
         true
+    }
+
+    fn set_option(&mut self, command: &str) {
+        let tokens = command.split_ascii_whitespace().skip(1).collect::<Vec<_>>();
+        let Some(value_index) = tokens.iter().position(|&token| token.eq_ignore_ascii_case("value")) else {
+            return;
+        };
+        if tokens.first().is_none_or(|token| !token.eq_ignore_ascii_case("name")) {
+            return;
+        }
+        let name = tokens[1..value_index].join(" ");
+        let value = tokens.get(value_index + 1).copied();
+        if name.eq_ignore_ascii_case("Hash")
+            && let Some(size) = value.and_then(|text| text.parse::<usize>().ok())
+        {
+            self.hash_size_mb = size.clamp(MIN_HASH_MB, MAX_HASH_MB);
+        }
     }
 
     fn set_position(&mut self, command: &str) -> Result<(), UciError> {
@@ -117,7 +146,8 @@ impl<W: Write + Send + 'static> UciEngine<W> {
 
     fn start_search(&mut self, params: GoParams, board: Board) {
         self.stop_search();
-        let limits = params.limits(board.side_to_move());
+        let mut limits = params.limits(board.side_to_move());
+        limits.hash_size_mb = self.hash_size_mb;
         let stop = Arc::new(AtomicBool::new(false));
         let search_stop = Arc::clone(&stop);
         let output = Arc::clone(&self.output);
@@ -237,6 +267,7 @@ impl GoParams {
             nodes: self.nodes,
             soft_time: budget.map(|value| value.soft),
             hard_time: budget.map(|value| value.hard),
+            ..SearchLimits::default()
         }
     }
 }
@@ -327,6 +358,23 @@ mod tests {
         assert_eq!(limits.nodes, Some(999));
         assert!(limits.soft_time.is_some());
         assert!(limits.hard_time > limits.soft_time);
+        assert_eq!(limits.hash_size_mb, DEFAULT_HASH_MB);
+    }
+
+    #[test]
+    fn hash_option_updates_and_clamps_the_table_size() {
+        let output = Arc::new(Mutex::new(SharedBuffer::default()));
+        let mut engine = UciEngine::new(output);
+
+        assert_eq!(engine.hash_size_mb, DEFAULT_HASH_MB);
+        assert!(engine.handle_command("setoption name Hash value 64"));
+        assert_eq!(engine.hash_size_mb, 64);
+        assert!(engine.handle_command("setoption name hash value 0"));
+        assert_eq!(engine.hash_size_mb, MIN_HASH_MB);
+        assert!(engine.handle_command("setoption name Hash value 999999"));
+        assert_eq!(engine.hash_size_mb, MAX_HASH_MB);
+        assert!(engine.handle_command("setoption name Unknown value 32"));
+        assert_eq!(engine.hash_size_mb, MAX_HASH_MB);
     }
 
     #[test]
@@ -341,7 +389,8 @@ mod tests {
         engine.stop_search();
 
         let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
-        assert!(text.contains("id name Baize-v0.3.0\n"));
+        assert!(text.contains("id name Baize-v0.4.0\n"));
+        assert!(text.contains("option name Hash type spin default 16 min 1 max 65536\n"));
         assert!(text.contains("uciok\n"));
         assert!(text.contains("readyok\n"));
         assert!(text.contains("bestmove "));

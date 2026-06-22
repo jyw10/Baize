@@ -5,16 +5,36 @@ use std::{
 
 use crate::{Board, Move, MoveKind, PieceType, evaluation};
 
+mod tt;
+
+use tt::{Bound, Entry, TranspositionTable, score_from_tt, score_to_tt};
+
 pub const MATE_SCORE: i32 = 30_000;
 pub const MAX_PLY: usize = 128;
+pub const DEFAULT_HASH_MB: usize = 16;
+pub const MIN_HASH_MB: usize = 1;
+pub const MAX_HASH_MB: usize = 65_536;
 const INFINITY: i32 = 32_000;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct SearchLimits {
     pub depth: Option<u8>,
     pub nodes: Option<u64>,
     pub soft_time: Option<Duration>,
     pub hard_time: Option<Duration>,
+    pub hash_size_mb: usize,
+}
+
+impl Default for SearchLimits {
+    fn default() -> Self {
+        Self {
+            depth: None,
+            nodes: None,
+            soft_time: None,
+            hard_time: None,
+            hash_size_mb: DEFAULT_HASH_MB,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +112,11 @@ impl SearchContext<'_> {
     }
 }
 
+struct SearchState<'a> {
+    context: SearchContext<'a>,
+    table: TranspositionTable,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Aborted;
 
@@ -102,6 +127,8 @@ pub fn iterative_deepening(
     stop: &AtomicBool,
     mut on_info: impl FnMut(SearchInfo),
 ) -> SearchOutcome {
+    let table_bytes = limits.hash_size_mb.saturating_mul(1024 * 1024);
+    let table = TranspositionTable::new(table_bytes);
     let start = Instant::now();
     let root_moves = board.legal_moves();
     let fallback = root_moves.first().copied();
@@ -109,12 +136,15 @@ pub fn iterative_deepening(
         .depth
         .unwrap_or((MAX_PLY - 1) as u8)
         .clamp(1, (MAX_PLY - 1) as u8);
-    let mut context = SearchContext {
-        stop,
-        start,
-        hard_time: limits.hard_time,
-        max_nodes: limits.nodes,
-        nodes: 0,
+    let mut search = SearchState {
+        context: SearchContext {
+            stop,
+            start,
+            hard_time: limits.hard_time,
+            max_nodes: limits.nodes,
+            nodes: 0,
+        },
+        table,
     };
     let mut outcome = SearchOutcome {
         best_move: fallback,
@@ -128,7 +158,7 @@ pub fn iterative_deepening(
     for depth in 1..=max_depth {
         let mut position = board.clone();
         let mut pv = PvLine::default();
-        let result = negamax(&mut position, depth, 0, -INFINITY, INFINITY, &mut context, &mut pv);
+        let result = negamax(&mut position, depth, 0, -INFINITY, INFINITY, &mut search, &mut pv);
         let Ok(score) = result else {
             break;
         };
@@ -138,23 +168,23 @@ pub fn iterative_deepening(
         outcome.best_move = pv.first().copied().or(fallback);
         outcome.score = score;
         outcome.completed_depth = depth;
-        outcome.nodes = context.nodes;
+        outcome.nodes = search.context.nodes;
         outcome.elapsed = elapsed;
         outcome.pv.clone_from(&pv);
         on_info(SearchInfo {
             depth,
             score,
-            nodes: context.nodes,
+            nodes: search.context.nodes,
             elapsed,
             pv,
         });
 
-        if context.should_stop_between_iterations(limits.soft_time) {
+        if search.context.should_stop_between_iterations(limits.soft_time) {
             break;
         }
     }
 
-    outcome.nodes = context.nodes;
+    outcome.nodes = search.context.nodes;
     outcome.elapsed = start.elapsed();
     outcome
 }
@@ -165,14 +195,14 @@ fn negamax(
     ply: usize,
     mut alpha: i32,
     beta: i32,
-    context: &mut SearchContext<'_>,
+    search: &mut SearchState<'_>,
     pv: &mut PvLine,
 ) -> Result<i32, Aborted> {
     if depth == 0 {
-        return quiescence(board, ply, alpha, beta, context, pv);
+        return quiescence(board, ply, alpha, beta, search, pv);
     }
 
-    context.enter_node()?;
+    search.context.enter_node()?;
     pv.len = 0;
 
     let mut moves = board.legal_moves();
@@ -190,20 +220,29 @@ fn negamax(
         return Ok(evaluation::evaluate(board));
     }
 
-    order_moves(board, &mut moves);
+    let key = board.hash();
+    let entry = search.table.probe(key);
+    if let Some(score) = entry.and_then(|stored| tt_cutoff(stored, depth, ply, alpha, beta)) {
+        return Ok(score);
+    }
+    let alpha_start = alpha;
+
+    order_moves(board, &mut moves, entry.and_then(|stored| stored.best_move));
 
     let mut best = -INFINITY;
+    let mut best_move = None;
     for mv in moves {
         let undo = board
             .make_move_unchecked(mv)
             .expect("legal move must be structurally valid");
         let mut child_pv = PvLine::default();
-        let child = negamax(board, depth - 1, ply + 1, -beta, -alpha, context, &mut child_pv);
+        let child = negamax(board, depth - 1, ply + 1, -beta, -alpha, search, &mut child_pv);
         board.unmake_move(undo);
         let score = -child?;
 
         if score > best {
             best = score;
+            best_move = Some(mv);
         }
         if score > alpha {
             alpha = score;
@@ -214,6 +253,13 @@ fn negamax(
         }
     }
 
+    search.table.store(Entry {
+        key,
+        score: score_to_tt(best, ply),
+        best_move,
+        depth,
+        bound: classify_bound(best, alpha_start, beta),
+    });
     Ok(best)
 }
 
@@ -222,10 +268,10 @@ fn quiescence(
     ply: usize,
     mut alpha: i32,
     beta: i32,
-    context: &mut SearchContext<'_>,
+    search: &mut SearchState<'_>,
     pv: &mut PvLine,
 ) -> Result<i32, Aborted> {
-    context.enter_node()?;
+    search.context.enter_node()?;
     pv.len = 0;
 
     let in_check = board.is_in_check(board.side_to_move());
@@ -240,29 +286,44 @@ fn quiescence(
         return Ok(evaluation::evaluate(board));
     }
 
+    let key = board.hash();
+    let entry = search.table.probe(key);
+    if let Some(score) = entry.and_then(|stored| tt_cutoff(stored, 0, ply, alpha, beta)) {
+        return Ok(score);
+    }
+    let alpha_start = alpha;
     let mut best = -INFINITY;
+    let mut best_move = None;
     if !in_check {
         let stand_pat = evaluation::evaluate(board);
         best = stand_pat;
         if stand_pat >= beta {
+            search.table.store(Entry {
+                key,
+                score: score_to_tt(stand_pat, ply),
+                best_move: None,
+                depth: 0,
+                bound: Bound::Lower,
+            });
             return Ok(stand_pat);
         }
         alpha = alpha.max(stand_pat);
         moves.retain(|&mv| is_tactical(board, mv));
     }
 
-    order_moves(board, &mut moves);
+    order_moves(board, &mut moves, entry.and_then(|stored| stored.best_move));
     for mv in moves {
         let undo = board
             .make_move_unchecked(mv)
             .expect("legal move must be structurally valid");
         let mut child_pv = PvLine::default();
-        let child = quiescence(board, ply + 1, -beta, -alpha, context, &mut child_pv);
+        let child = quiescence(board, ply + 1, -beta, -alpha, search, &mut child_pv);
         board.unmake_move(undo);
         let score = -child?;
 
         if score > best {
             best = score;
+            best_move = Some(mv);
         }
         if score > alpha {
             alpha = score;
@@ -273,6 +334,13 @@ fn quiescence(
         }
     }
 
+    search.table.store(Entry {
+        key,
+        score: score_to_tt(best, ply),
+        best_move,
+        depth: 0,
+        bound: classify_bound(best, alpha_start, beta),
+    });
     Ok(best)
 }
 
@@ -280,8 +348,31 @@ fn is_tactical(board: &Board, mv: Move) -> bool {
     mv.promotion().is_some() || mvv_lva_score(board, mv) > 0
 }
 
-fn order_moves(board: &Board, moves: &mut [Move]) {
-    moves.sort_by_key(|&mv| std::cmp::Reverse(mvv_lva_score(board, mv)));
+fn tt_cutoff(entry: Entry, depth: u8, ply: usize, alpha: i32, beta: i32) -> Option<i32> {
+    if entry.depth < depth {
+        return None;
+    }
+    let score = score_from_tt(entry.score, ply);
+    match entry.bound {
+        Bound::Exact => Some(score),
+        Bound::Lower if score >= beta => Some(score),
+        Bound::Upper if score <= alpha => Some(score),
+        Bound::Lower | Bound::Upper => None,
+    }
+}
+
+fn classify_bound(score: i32, alpha: i32, beta: i32) -> Bound {
+    if score <= alpha {
+        Bound::Upper
+    } else if score >= beta {
+        Bound::Lower
+    } else {
+        Bound::Exact
+    }
+}
+
+fn order_moves(board: &Board, moves: &mut [Move], tt_move: Option<Move>) {
+    moves.sort_by_key(|&mv| std::cmp::Reverse((Some(mv) == tt_move, mvv_lva_score(board, mv))));
 }
 
 fn mvv_lva_score(board: &Board, mv: Move) -> i32 {
@@ -329,13 +420,16 @@ mod tests {
 
     use super::*;
 
-    fn unlimited_context(stop: &AtomicBool) -> SearchContext<'_> {
-        SearchContext {
-            stop,
-            start: Instant::now(),
-            hard_time: None,
-            max_nodes: None,
-            nodes: 0,
+    fn unlimited_search(stop: &AtomicBool) -> SearchState<'_> {
+        SearchState {
+            context: SearchContext {
+                stop,
+                start: Instant::now(),
+                hard_time: None,
+                max_nodes: None,
+                nodes: 0,
+            },
+            table: TranspositionTable::new(64 * 1024),
         }
     }
 
@@ -378,10 +472,27 @@ mod tests {
     fn fail_soft_returns_score_beyond_beta() {
         let mut board = Board::from_fen("4k3/8/8/8/8/8/4Q3/4K3 w - - 0 1").unwrap();
         let stop = AtomicBool::new(false);
-        let mut context = unlimited_context(&stop);
+        let mut search = unlimited_search(&stop);
         let mut pv = PvLine::default();
-        let score = negamax(&mut board, 1, 0, -50, 50, &mut context, &mut pv).unwrap();
+        let score = negamax(&mut board, 1, 0, -50, 50, &mut search, &mut pv).unwrap();
         assert_eq!(score, 900, "fail-soft search returned a bound instead of the score");
+    }
+
+    #[test]
+    fn exact_tt_entry_avoids_researching_a_position() {
+        let mut board = Board::default();
+        let stop = AtomicBool::new(false);
+        let mut search = unlimited_search(&stop);
+        let mut first_pv = PvLine::default();
+        let first_score = negamax(&mut board, 3, 0, -INFINITY, INFINITY, &mut search, &mut first_pv).unwrap();
+        assert!(search.context.nodes > 1);
+
+        search.context.nodes = 0;
+        let mut second_pv = PvLine::default();
+        let second_score = negamax(&mut board, 3, 0, -INFINITY, INFINITY, &mut search, &mut second_pv).unwrap();
+
+        assert_eq!(second_score, first_score);
+        assert_eq!(search.context.nodes, 1);
     }
 
     #[test]
@@ -407,10 +518,10 @@ mod tests {
     fn quiescence_searches_quiet_promotions() {
         let mut board = Board::from_fen("7k/P7/8/8/8/8/8/7K w - - 0 1").unwrap();
         let stop = AtomicBool::new(false);
-        let mut context = unlimited_context(&stop);
+        let mut search = unlimited_search(&stop);
         let mut pv = PvLine::default();
 
-        let score = quiescence(&mut board, 0, -INFINITY, INFINITY, &mut context, &mut pv).unwrap();
+        let score = quiescence(&mut board, 0, -INFINITY, INFINITY, &mut search, &mut pv).unwrap();
 
         assert_eq!(score, 900);
         assert_eq!(pv.moves[0].promotion(), Some(PieceType::Queen));
@@ -420,13 +531,13 @@ mod tests {
     fn quiescence_searches_all_legal_evasions_while_in_check() {
         let mut board = Board::from_fen("4r1k1/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
         let stop = AtomicBool::new(false);
-        let mut context = unlimited_context(&stop);
+        let mut search = unlimited_search(&stop);
         let mut pv = PvLine::default();
 
-        let score = quiescence(&mut board, 0, -INFINITY, INFINITY, &mut context, &mut pv).unwrap();
+        let score = quiescence(&mut board, 0, -INFINITY, INFINITY, &mut search, &mut pv).unwrap();
 
         assert_eq!(score, -500);
-        assert!(context.nodes > 1, "quiet check evasions were not searched");
+        assert!(search.context.nodes > 1, "quiet check evasions were not searched");
         assert_eq!(pv.len, 1);
     }
 
@@ -434,16 +545,16 @@ mod tests {
     fn quiescence_stand_pat_cutoff_is_fail_soft() {
         let mut board = Board::from_fen("4k3/8/8/8/8/8/4Q3/4K3 w - - 0 1").unwrap();
         let stop = AtomicBool::new(false);
-        let mut context = unlimited_context(&stop);
+        let mut search = unlimited_search(&stop);
         let mut pv = PvLine::default();
 
-        let score = quiescence(&mut board, 0, -50, 50, &mut context, &mut pv).unwrap();
+        let score = quiescence(&mut board, 0, -50, 50, &mut search, &mut pv).unwrap();
 
         assert_eq!(score, 900);
     }
 
     #[test]
-    fn orders_captures_by_mvv_lva_before_quiet_moves() {
+    fn orders_tt_move_before_mvv_lva_captures_and_quiet_moves() {
         let board = Board::from_fen("k7/8/8/3q3r/4P3/8/8/K2Q4 w - - 0 1").unwrap();
         let pawn_takes_queen = Move::new("e4".parse().unwrap(), "d5".parse().unwrap());
         let queen_takes_queen = Move::new("d1".parse().unwrap(), "d5".parse().unwrap());
@@ -451,9 +562,12 @@ mod tests {
         let quiet = Move::new("d1".parse().unwrap(), "d2".parse().unwrap());
         let mut moves = [quiet, queen_takes_rook, queen_takes_queen, pawn_takes_queen];
 
-        order_moves(&board, &mut moves);
+        order_moves(&board, &mut moves, None);
 
         assert_eq!(moves, [pawn_takes_queen, queen_takes_queen, queen_takes_rook, quiet]);
+
+        order_moves(&board, &mut moves, Some(quiet));
+        assert_eq!(moves, [quiet, pawn_takes_queen, queen_takes_queen, queen_takes_rook]);
     }
 
     #[test]
