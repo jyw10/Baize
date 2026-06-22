@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Board, Move, evaluation};
+use crate::{Board, Move, MoveKind, PieceType, evaluation};
 
 pub const MATE_SCORE: i32 = 30_000;
 pub const MAX_PLY: usize = 128;
@@ -171,7 +171,7 @@ fn negamax(
     context.enter_node()?;
     pv.len = 0;
 
-    let moves = board.legal_moves();
+    let mut moves = board.legal_moves();
     if moves.is_empty() {
         return Ok(if board.is_in_check(board.side_to_move()) {
             -MATE_SCORE + ply as i32
@@ -185,6 +185,8 @@ fn negamax(
     if depth == 0 || ply + 1 >= MAX_PLY {
         return Ok(evaluation::evaluate(board));
     }
+
+    order_moves(board, &mut moves);
 
     let mut best = -INFINITY;
     for mv in moves {
@@ -209,6 +211,38 @@ fn negamax(
     }
 
     Ok(best)
+}
+
+fn order_moves(board: &Board, moves: &mut [Move]) {
+    moves.sort_by_key(|&mv| std::cmp::Reverse(mvv_lva_score(board, mv)));
+}
+
+fn mvv_lva_score(board: &Board, mv: Move) -> i32 {
+    let victim = match mv.kind() {
+        MoveKind::EnPassant => Some(PieceType::Pawn),
+        MoveKind::Castling => None,
+        MoveKind::Normal | MoveKind::Promotion => board.piece_at(mv.to()).map(|piece| piece.kind),
+    };
+    let Some(victim) = victim else {
+        return 0;
+    };
+    let attacker = board
+        .piece_at(mv.from())
+        .expect("generated move source must contain a piece")
+        .kind;
+
+    64 + piece_order_value(victim) * 8 - piece_order_value(attacker)
+}
+
+const fn piece_order_value(kind: PieceType) -> i32 {
+    match kind {
+        PieceType::Pawn => 1,
+        PieceType::Knight => 2,
+        PieceType::Bishop => 3,
+        PieceType::Rook => 4,
+        PieceType::Queen => 5,
+        PieceType::King => 6,
+    }
 }
 
 #[must_use]
@@ -277,5 +311,30 @@ mod tests {
         let mut pv = PvLine::default();
         let score = negamax(&mut board, 1, 0, -50, 50, &mut context, &mut pv).unwrap();
         assert_eq!(score, 900, "fail-soft search returned a bound instead of the score");
+    }
+
+    #[test]
+    fn orders_captures_by_mvv_lva_before_quiet_moves() {
+        let board = Board::from_fen("k7/8/8/3q3r/4P3/8/8/K2Q4 w - - 0 1").unwrap();
+        let pawn_takes_queen = Move::new("e4".parse().unwrap(), "d5".parse().unwrap());
+        let queen_takes_queen = Move::new("d1".parse().unwrap(), "d5".parse().unwrap());
+        let queen_takes_rook = Move::new("d1".parse().unwrap(), "h5".parse().unwrap());
+        let quiet = Move::new("d1".parse().unwrap(), "d2".parse().unwrap());
+        let mut moves = [quiet, queen_takes_rook, queen_takes_queen, pawn_takes_queen];
+
+        order_moves(&board, &mut moves);
+
+        assert_eq!(moves, [pawn_takes_queen, queen_takes_queen, queen_takes_rook, quiet]);
+    }
+
+    #[test]
+    fn recognizes_en_passant_but_not_internal_castling_as_a_capture() {
+        let en_passant_board = Board::from_fen("k7/8/8/3pP3/8/8/8/K7 w - d6 0 1").unwrap();
+        let en_passant = Move::new_en_passant("e5".parse().unwrap(), "d6".parse().unwrap());
+        assert!(mvv_lva_score(&en_passant_board, en_passant) > 0);
+
+        let castling_board = Board::default();
+        let castling = Move::new_castling("e1".parse().unwrap(), "h1".parse().unwrap());
+        assert_eq!(mvv_lva_score(&castling_board, castling), 0);
     }
 }

@@ -56,7 +56,7 @@ impl<W: Write + Send + 'static> UciEngine<W> {
             "uci" => {
                 emit(
                     &self.output,
-                    format_args!("id name Baize {}", env!("CARGO_PKG_VERSION")),
+                    format_args!("id name Baize-v{}", env!("CARGO_PKG_VERSION")),
                 );
                 emit(&self.output, format_args!("id author Baize contributors"));
                 emit(&self.output, format_args!("uciok"));
@@ -341,6 +341,7 @@ mod tests {
         engine.stop_search();
 
         let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("id name Baize-v0.2.0\n"));
         assert!(text.contains("uciok\n"));
         assert!(text.contains("readyok\n"));
         assert!(text.contains("bestmove "));
