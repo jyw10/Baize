@@ -1,0 +1,22 @@
+[package]
+name = "baize"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "A competitive UCI chess engine written in Rust"
+repository = "https://github.com/jyw10/Baize"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
