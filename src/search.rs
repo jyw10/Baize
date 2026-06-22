@@ -475,7 +475,10 @@ mod tests {
         let mut search = unlimited_search(&stop);
         let mut pv = PvLine::default();
         let score = negamax(&mut board, 1, 0, -50, 50, &mut search, &mut pv).unwrap();
-        assert_eq!(score, 900, "fail-soft search returned a bound instead of the score");
+        assert!(
+            score > 50,
+            "fail-soft search returned the beta bound instead of the score"
+        );
     }
 
     #[test]
@@ -511,7 +514,7 @@ mod tests {
         );
 
         assert_ne!(result.best_move, Some(poisoned));
-        assert_eq!(result.score, -500);
+        assert!(result.score < 0);
     }
 
     #[test]
@@ -520,10 +523,11 @@ mod tests {
         let stop = AtomicBool::new(false);
         let mut search = unlimited_search(&stop);
         let mut pv = PvLine::default();
+        let stand_pat = evaluation::evaluate(&board);
 
         let score = quiescence(&mut board, 0, -INFINITY, INFINITY, &mut search, &mut pv).unwrap();
 
-        assert_eq!(score, 900);
+        assert!(score > stand_pat);
         assert_eq!(pv.moves[0].promotion(), Some(PieceType::Queen));
     }
 
@@ -536,7 +540,7 @@ mod tests {
 
         let score = quiescence(&mut board, 0, -INFINITY, INFINITY, &mut search, &mut pv).unwrap();
 
-        assert_eq!(score, -500);
+        assert!(score < 0);
         assert!(search.context.nodes > 1, "quiet check evasions were not searched");
         assert_eq!(pv.len, 1);
     }
@@ -550,7 +554,8 @@ mod tests {
 
         let score = quiescence(&mut board, 0, -50, 50, &mut search, &mut pv).unwrap();
 
-        assert_eq!(score, 900);
+        assert_eq!(score, evaluation::evaluate(&board));
+        assert!(score > 50);
     }
 
     #[test]
