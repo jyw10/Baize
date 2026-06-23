@@ -15,6 +15,7 @@ pub const DEFAULT_HASH_MB: usize = 16;
 pub const MIN_HASH_MB: usize = 1;
 pub const MAX_HASH_MB: usize = 65_536;
 const INFINITY: i32 = 32_000;
+const ASPIRATION_WINDOW: i32 = 25;
 const HISTORY_MAX: i32 = 16_384;
 
 #[derive(Clone, Copy, Debug)]
@@ -93,6 +94,8 @@ struct SearchContext<'a> {
     nodes: u64,
     #[cfg(test)]
     pvs_researches: u64,
+    #[cfg(test)]
+    aspiration_researches: u64,
 }
 
 impl SearchContext<'_> {
@@ -174,6 +177,8 @@ pub fn iterative_deepening(
             nodes: 0,
             #[cfg(test)]
             pvs_researches: 0,
+            #[cfg(test)]
+            aspiration_researches: 0,
         },
         table,
         history: ButterflyHistory::default(),
@@ -187,11 +192,10 @@ pub fn iterative_deepening(
         pv: fallback.into_iter().collect(),
     };
 
+    let mut previous_score = None;
     for depth in 1..=max_depth {
-        let mut position = board.clone();
-        let mut pv = PvLine::default();
-        let result = negamax(&mut position, depth, 0, -INFINITY, INFINITY, &mut search, &mut pv);
-        let Ok(score) = result else {
+        let result = search_root(board, depth, previous_score, &mut search);
+        let Ok((score, pv)) = result else {
             break;
         };
 
@@ -203,6 +207,7 @@ pub fn iterative_deepening(
         outcome.nodes = search.context.nodes;
         outcome.elapsed = elapsed;
         outcome.pv.clone_from(&pv);
+        previous_score = Some(score);
         on_info(SearchInfo {
             depth,
             score,
@@ -219,6 +224,45 @@ pub fn iterative_deepening(
     outcome.nodes = search.context.nodes;
     outcome.elapsed = start.elapsed();
     outcome
+}
+
+fn search_root(
+    board: &Board,
+    depth: u8,
+    previous_score: Option<i32>,
+    search: &mut SearchState<'_>,
+) -> Result<(i32, PvLine), Aborted> {
+    let mut alpha = -INFINITY;
+    let mut beta = INFINITY;
+    let mut delta = ASPIRATION_WINDOW;
+    if let Some(score) = previous_score {
+        alpha = (score - delta).max(-INFINITY);
+        beta = (score + delta).min(INFINITY);
+    }
+
+    loop {
+        let mut position = board.clone();
+        let mut pv = PvLine::default();
+        let score = negamax(&mut position, depth, 0, alpha, beta, search, &mut pv)?;
+
+        if score <= alpha && alpha > -INFINITY {
+            #[cfg(test)]
+            {
+                search.context.aspiration_researches += 1;
+            }
+            alpha = (score - delta).max(-INFINITY);
+        } else if score >= beta && beta < INFINITY {
+            #[cfg(test)]
+            {
+                search.context.aspiration_researches += 1;
+            }
+            beta = (score + delta).min(INFINITY);
+        } else {
+            return Ok((score, pv));
+        }
+
+        delta = delta.saturating_mul(2).min(INFINITY);
+    }
 }
 
 fn negamax(
@@ -507,6 +551,7 @@ mod tests {
                 max_nodes: None,
                 nodes: 0,
                 pvs_researches: 0,
+                aspiration_researches: 0,
             },
             table: TranspositionTable::new(64 * 1024),
             history: ButterflyHistory::default(),
@@ -582,6 +627,35 @@ mod tests {
 
         assert_eq!(second_score, first_score);
         assert_eq!(search.context.nodes, 1);
+    }
+
+    #[test]
+    fn aspiration_researches_after_a_failed_window() {
+        let board = Board::from_fen("4k3/8/8/8/8/8/4Q3/4K3 w - - 0 1").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut full_search = unlimited_search(&stop);
+        let (full_score, _) = search_root(&board, 1, None, &mut full_search).unwrap();
+
+        let mut aspiration_search = unlimited_search(&stop);
+        let (aspiration_score, _) = search_root(&board, 1, Some(0), &mut aspiration_search).unwrap();
+
+        assert_eq!(aspiration_score, full_score);
+        assert!(aspiration_search.context.aspiration_researches > 0);
+    }
+
+    #[test]
+    fn aspiration_accepts_a_score_on_the_original_window_boundary() {
+        let board = Board::starting_position();
+        let stop = AtomicBool::new(false);
+        let mut full_search = unlimited_search(&stop);
+        let (full_score, _) = search_root(&board, 1, None, &mut full_search).unwrap();
+
+        let mut aspiration_search = unlimited_search(&stop);
+        let (aspiration_score, _) =
+            search_root(&board, 1, Some(full_score - ASPIRATION_WINDOW), &mut aspiration_search).unwrap();
+
+        assert_eq!(aspiration_score, full_score);
+        assert!(aspiration_search.context.aspiration_researches > 0);
     }
 
     #[test]
