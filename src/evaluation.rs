@@ -1,10 +1,16 @@
-use crate::{Board, Color, PieceType, Square};
+use crate::{Board, Color, PieceType, Square, types::BitboardIter};
 
 const MAX_PHASE: i32 = 24;
 const PHASE_WEIGHTS: [i32; 6] = [0, 1, 1, 2, 4, 0];
 
 const MIDDLEGAME_VALUES: [i32; 6] = [100, 320, 335, 500, 900, 0];
 const ENDGAME_VALUES: [i32; 6] = [120, 305, 325, 520, 900, 0];
+const DOUBLED_PAWN_MG: i32 = -8;
+const DOUBLED_PAWN_EG: i32 = -12;
+const ISOLATED_PAWN_MG: i32 = -10;
+const ISOLATED_PAWN_EG: i32 = -8;
+const PASSED_PAWN_MG_BY_RANK: [i32; 8] = [0, 4, 8, 14, 24, 40, 70, 0];
+const PASSED_PAWN_EG_BY_RANK: [i32; 8] = [0, 8, 16, 28, 48, 80, 130, 0];
 
 type HalfBoardTable = [[i32; 4]; 8];
 
@@ -149,6 +155,9 @@ pub fn evaluate(board: &Board) -> i32 {
         middlegame += sign * (MIDDLEGAME_VALUES[kind] + table_value(&MIDDLEGAME_TABLES[kind], relative_square));
         endgame += sign * (ENDGAME_VALUES[kind] + table_value(&ENDGAME_TABLES[kind], relative_square));
     }
+    let (pawn_middlegame, pawn_endgame) = pawn_structure(board);
+    middlegame += pawn_middlegame;
+    endgame += pawn_endgame;
 
     let phase = game_phase(board);
     let white_relative = (middlegame * phase + endgame * (MAX_PHASE - phase)) / MAX_PHASE;
@@ -165,6 +174,64 @@ fn game_phase(board: &Board) -> i32 {
         .map(|kind| PHASE_WEIGHTS[kind.index()] * board.pieces(kind).count_ones() as i32)
         .sum::<i32>()
         .min(MAX_PHASE)
+}
+
+fn pawn_structure(board: &Board) -> (i32, i32) {
+    let mut middlegame = 0;
+    let mut endgame = 0;
+
+    for color in Color::ALL {
+        let pawns = board.colored_pieces(color, PieceType::Pawn);
+        let file_counts = pawn_file_counts(pawns);
+        let sign = if color == Color::White { 1 } else { -1 };
+
+        for count in file_counts {
+            if count > 1 {
+                let extra = i32::from(count - 1);
+                middlegame += sign * DOUBLED_PAWN_MG * extra;
+                endgame += sign * DOUBLED_PAWN_EG * extra;
+            }
+        }
+
+        let enemy_pawns = board.colored_pieces(!color, PieceType::Pawn);
+        for square in BitboardIter(pawns) {
+            if is_isolated_pawn(square.file(), &file_counts) {
+                middlegame += sign * ISOLATED_PAWN_MG;
+                endgame += sign * ISOLATED_PAWN_EG;
+            }
+            if is_passed_pawn(color, square, enemy_pawns) {
+                let rank = relative_square(color, square).rank() as usize;
+                middlegame += sign * PASSED_PAWN_MG_BY_RANK[rank];
+                endgame += sign * PASSED_PAWN_EG_BY_RANK[rank];
+            }
+        }
+    }
+
+    (middlegame, endgame)
+}
+
+fn pawn_file_counts(pawns: u64) -> [u8; 8] {
+    let mut counts = [0; 8];
+    for square in BitboardIter(pawns) {
+        counts[square.file() as usize] += 1;
+    }
+    counts
+}
+
+fn is_isolated_pawn(file: u8, file_counts: &[u8; 8]) -> bool {
+    let left_empty = file == 0 || file_counts[file as usize - 1] == 0;
+    let right_empty = file == 7 || file_counts[file as usize + 1] == 0;
+    left_empty && right_empty
+}
+
+fn is_passed_pawn(color: Color, square: Square, enemy_pawns: u64) -> bool {
+    BitboardIter(enemy_pawns).all(|enemy| {
+        enemy.file().abs_diff(square.file()) > 1
+            || match color {
+                Color::White => enemy.rank() <= square.rank(),
+                Color::Black => enemy.rank() >= square.rank(),
+            }
+    })
 }
 
 const fn relative_square(color: Color, square: Square) -> Square {
@@ -204,6 +271,13 @@ mod tests {
     }
 
     #[test]
+    fn black_pawn_structure_mirrors_white_pawn_structure() {
+        let white = Board::from_fen("4k3/8/8/8/4P3/8/8/4K3 w - - 0 1").unwrap();
+        let black = Board::from_fen("4k3/8/8/4p3/8/8/8/4K3 b - - 0 1").unwrap();
+        assert_eq!(evaluate(&white), evaluate(&black));
+    }
+
+    #[test]
     fn phase_is_bounded_by_normal_starting_material() {
         assert_eq!(game_phase(&Board::starting_position()), MAX_PHASE);
         let kings = Board::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
@@ -225,5 +299,32 @@ mod tests {
         let center = Board::from_fen("4k3/8/8/8/3K4/8/8/8 w - - 0 1").unwrap();
         let corner = Board::from_fen("4k3/8/8/8/8/8/8/K7 w - - 0 1").unwrap();
         assert!(evaluate(&center) > evaluate(&corner));
+    }
+
+    #[test]
+    fn doubled_pawns_are_penalized() {
+        let doubled = Board::from_fen("4k3/3ppp2/8/8/8/4P3/3PP3/4K3 w - - 0 1").unwrap();
+        let spread = Board::from_fen("4k3/3ppp2/8/8/8/8/3PPP2/4K3 w - - 0 1").unwrap();
+
+        assert!(pawn_structure(&doubled).0 < pawn_structure(&spread).0);
+        assert!(pawn_structure(&doubled).1 < pawn_structure(&spread).1);
+    }
+
+    #[test]
+    fn isolated_pawns_are_penalized() {
+        let isolated = Board::from_fen("4k3/3ppp2/8/8/8/8/3P1P2/4K3 w - - 0 1").unwrap();
+        let connected = Board::from_fen("4k3/3ppp2/8/8/8/8/3PP3/4K3 w - - 0 1").unwrap();
+
+        assert!(pawn_structure(&isolated).0 < pawn_structure(&connected).0);
+        assert!(pawn_structure(&isolated).1 < pawn_structure(&connected).1);
+    }
+
+    #[test]
+    fn passed_pawns_gain_value_as_they_advance() {
+        let fourth_rank = Board::from_fen("4k3/8/8/8/4P3/8/8/4K3 w - - 0 1").unwrap();
+        let fifth_rank = Board::from_fen("4k3/8/8/4P3/8/8/8/4K3 w - - 0 1").unwrap();
+
+        assert!(pawn_structure(&fifth_rank).0 > pawn_structure(&fourth_rank).0);
+        assert!(pawn_structure(&fifth_rank).1 > pawn_structure(&fourth_rank).1);
     }
 }
