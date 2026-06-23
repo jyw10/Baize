@@ -91,6 +91,8 @@ struct SearchContext<'a> {
     hard_time: Option<Duration>,
     max_nodes: Option<u64>,
     nodes: u64,
+    #[cfg(test)]
+    pvs_researches: u64,
 }
 
 impl SearchContext<'_> {
@@ -170,6 +172,8 @@ pub fn iterative_deepening(
             hard_time: limits.hard_time,
             max_nodes: limits.nodes,
             nodes: 0,
+            #[cfg(test)]
+            pvs_researches: 0,
         },
         table,
         history: ButterflyHistory::default(),
@@ -265,14 +269,33 @@ fn negamax(
 
     let mut best = -INFINITY;
     let mut best_move = None;
+    let mut first_move = true;
     for mv in moves {
         let undo = board
             .make_move_unchecked(mv)
             .expect("legal move must be structurally valid");
         let mut child_pv = PvLine::default();
-        let child = negamax(board, depth - 1, ply + 1, -beta, -alpha, search, &mut child_pv);
+        let child = if first_move {
+            negamax(board, depth - 1, ply + 1, -beta, -alpha, search, &mut child_pv).map(|score| -score)
+        } else {
+            negamax(board, depth - 1, ply + 1, -alpha - 1, -alpha, search, &mut child_pv)
+                .map(|score| -score)
+                .and_then(|score| {
+                    if score > alpha && score < beta {
+                        child_pv = PvLine::default();
+                        #[cfg(test)]
+                        {
+                            search.context.pvs_researches += 1;
+                        }
+                        negamax(board, depth - 1, ply + 1, -beta, -alpha, search, &mut child_pv).map(|score| -score)
+                    } else {
+                        Ok(score)
+                    }
+                })
+        };
         board.unmake_move(undo);
-        let score = -child?;
+        let score = child?;
+        first_move = false;
 
         if score > best {
             best = score;
@@ -483,6 +506,7 @@ mod tests {
                 hard_time: None,
                 max_nodes: None,
                 nodes: 0,
+                pvs_researches: 0,
             },
             table: TranspositionTable::new(64 * 1024),
             history: ButterflyHistory::default(),
@@ -558,6 +582,19 @@ mod tests {
 
         assert_eq!(second_score, first_score);
         assert_eq!(search.context.nodes, 1);
+    }
+
+    #[test]
+    fn pvs_researches_a_later_move_that_improves_alpha() {
+        let mut board = Board::starting_position();
+        let stop = AtomicBool::new(false);
+        let mut search = unlimited_search(&stop);
+        let mut pv = PvLine::default();
+
+        negamax(&mut board, 1, 0, -INFINITY, INFINITY, &mut search, &mut pv).unwrap();
+
+        assert!(search.context.pvs_researches > 0);
+        assert_eq!(pv.moves[0], Move::new("b1".parse().unwrap(), "c3".parse().unwrap()));
     }
 
     #[test]
