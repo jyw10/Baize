@@ -126,6 +126,29 @@ impl Board {
         })
     }
 
+    pub(crate) fn make_null_move(&mut self) -> Undo {
+        debug_assert!(!self.is_in_check(self.side_to_move()));
+        let previous = self.state;
+        let previous_history_len = self.hash_history.len();
+        let old_kings = [
+            self.king_square(Color::White).expect("legal board has a white king"),
+            self.king_square(Color::Black).expect("legal board has a black king"),
+        ];
+
+        self.state.hash ^= self.ep_hash();
+        self.state.en_passant = None;
+        self.state.side_to_move = !self.state.side_to_move;
+        self.state.hash ^= zobrist::side();
+        self.hash_history.push(self.state.hash);
+
+        debug_assert!(self.validate());
+        Undo {
+            previous,
+            previous_history_len,
+            delta: PieceDelta::new(old_kings),
+        }
+    }
+
     pub fn unmake_move(&mut self, undo: Undo) {
         for entry in undo.delta.added() {
             let removed = self.remove_piece_raw(entry.square);

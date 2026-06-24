@@ -19,6 +19,8 @@ const ASPIRATION_WINDOW: i32 = 25;
 const HISTORY_MAX: i32 = 16_384;
 const RFP_MAX_DEPTH: u8 = 4;
 const RFP_MARGIN_PER_DEPTH: i32 = 80;
+const NMP_MIN_DEPTH: u8 = 3;
+const NMP_REDUCTION: u8 = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SearchLimits {
@@ -100,6 +102,8 @@ struct SearchContext<'a> {
     aspiration_researches: u64,
     #[cfg(test)]
     rfp_prunes: u64,
+    #[cfg(test)]
+    nmp_prunes: u64,
 }
 
 impl SearchContext<'_> {
@@ -156,6 +160,25 @@ impl ButterflyHistory {
 #[derive(Clone, Copy, Debug)]
 struct Aborted;
 
+#[derive(Clone, Copy, Debug)]
+struct NodeState {
+    ply: usize,
+    allow_null_move: bool,
+}
+
+impl NodeState {
+    const fn new(ply: usize, allow_null_move: bool) -> Self {
+        Self { ply, allow_null_move }
+    }
+
+    const fn child(self, allow_null_move: bool) -> Self {
+        Self {
+            ply: self.ply + 1,
+            allow_null_move,
+        }
+    }
+}
+
 /// Runs deterministic iterative deepening and reports each completed depth.
 pub fn iterative_deepening(
     board: &Board,
@@ -185,6 +208,8 @@ pub fn iterative_deepening(
             aspiration_researches: 0,
             #[cfg(test)]
             rfp_prunes: 0,
+            #[cfg(test)]
+            nmp_prunes: 0,
         },
         table,
         history: ButterflyHistory::default(),
@@ -249,7 +274,15 @@ fn search_root(
     loop {
         let mut position = board.clone();
         let mut pv = PvLine::default();
-        let score = negamax(&mut position, depth, 0, alpha, beta, search, &mut pv)?;
+        let score = negamax(
+            &mut position,
+            depth,
+            NodeState::new(0, true),
+            alpha,
+            beta,
+            search,
+            &mut pv,
+        )?;
 
         if score <= alpha && alpha > -INFINITY {
             #[cfg(test)]
@@ -274,12 +307,13 @@ fn search_root(
 fn negamax(
     board: &mut Board,
     depth: u8,
-    ply: usize,
+    node: NodeState,
     mut alpha: i32,
     beta: i32,
     search: &mut SearchState<'_>,
     pv: &mut PvLine,
 ) -> Result<i32, Aborted> {
+    let ply = node.ply;
     if depth == 0 {
         return quiescence(board, ply, alpha, beta, search, pv);
     }
@@ -312,6 +346,28 @@ fn negamax(
         }
         return Ok(static_eval);
     }
+    if can_null_move_prune(board, depth, ply, in_check, beta, static_eval, node.allow_null_move) {
+        let undo = board.make_null_move();
+        let mut null_pv = PvLine::default();
+        let child = negamax(
+            board,
+            depth.saturating_sub(NMP_REDUCTION + 1),
+            node.child(false),
+            -beta,
+            -beta + 1,
+            search,
+            &mut null_pv,
+        );
+        board.unmake_move(undo);
+        let score = -child?;
+        if score >= beta {
+            #[cfg(test)]
+            {
+                search.context.nmp_prunes += 1;
+            }
+            return Ok(score);
+        }
+    }
     let alpha_start = alpha;
 
     let side_to_move = board.side_to_move();
@@ -331,22 +387,31 @@ fn negamax(
             .expect("legal move must be structurally valid");
         let mut child_pv = PvLine::default();
         let child = if first_move {
-            negamax(board, depth - 1, ply + 1, -beta, -alpha, search, &mut child_pv).map(|score| -score)
+            negamax(board, depth - 1, node.child(true), -beta, -alpha, search, &mut child_pv).map(|score| -score)
         } else {
-            negamax(board, depth - 1, ply + 1, -alpha - 1, -alpha, search, &mut child_pv)
-                .map(|score| -score)
-                .and_then(|score| {
-                    if score > alpha && score < beta {
-                        child_pv = PvLine::default();
-                        #[cfg(test)]
-                        {
-                            search.context.pvs_researches += 1;
-                        }
-                        negamax(board, depth - 1, ply + 1, -beta, -alpha, search, &mut child_pv).map(|score| -score)
-                    } else {
-                        Ok(score)
+            negamax(
+                board,
+                depth - 1,
+                node.child(true),
+                -alpha - 1,
+                -alpha,
+                search,
+                &mut child_pv,
+            )
+            .map(|score| -score)
+            .and_then(|score| {
+                if score > alpha && score < beta {
+                    child_pv = PvLine::default();
+                    #[cfg(test)]
+                    {
+                        search.context.pvs_researches += 1;
                     }
-                })
+                    negamax(board, depth - 1, node.child(true), -beta, -alpha, search, &mut child_pv)
+                        .map(|score| -score)
+                } else {
+                    Ok(score)
+                }
+            })
         };
         board.unmake_move(undo);
         let score = child?;
@@ -480,6 +545,30 @@ fn reverse_futility_margin(depth: u8) -> i32 {
     RFP_MARGIN_PER_DEPTH * i32::from(depth)
 }
 
+fn can_null_move_prune(
+    board: &Board,
+    depth: u8,
+    ply: usize,
+    in_check: bool,
+    beta: i32,
+    static_eval: i32,
+    allow_null_move: bool,
+) -> bool {
+    allow_null_move
+        && ply > 0
+        && depth >= NMP_MIN_DEPTH
+        && !in_check
+        && static_eval >= beta
+        && beta.abs() < MATE_SCORE - MAX_PLY as i32
+        && has_non_pawn_material(board, board.side_to_move())
+}
+
+fn has_non_pawn_material(board: &Board, color: Color) -> bool {
+    [PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen]
+        .into_iter()
+        .any(|kind| board.colored_pieces(color, kind) != 0)
+}
+
 fn tt_cutoff(entry: Entry, depth: u8, ply: usize, alpha: i32, beta: i32) -> Option<i32> {
     if entry.depth < depth {
         return None;
@@ -572,6 +661,7 @@ mod tests {
                 pvs_researches: 0,
                 aspiration_researches: 0,
                 rfp_prunes: 0,
+                nmp_prunes: 0,
             },
             table: TranspositionTable::new(64 * 1024),
             history: ButterflyHistory::default(),
@@ -619,7 +709,7 @@ mod tests {
         let stop = AtomicBool::new(false);
         let mut search = unlimited_search(&stop);
         let mut pv = PvLine::default();
-        let score = negamax(&mut board, 1, 0, -50, 50, &mut search, &mut pv).unwrap();
+        let score = negamax(&mut board, 1, NodeState::new(0, true), -50, 50, &mut search, &mut pv).unwrap();
         assert!(
             score > 50,
             "fail-soft search returned the beta bound instead of the score"
@@ -638,12 +728,30 @@ mod tests {
         let stop = AtomicBool::new(false);
         let mut search = unlimited_search(&stop);
         let mut first_pv = PvLine::default();
-        let first_score = negamax(&mut board, 3, 0, -INFINITY, INFINITY, &mut search, &mut first_pv).unwrap();
+        let first_score = negamax(
+            &mut board,
+            3,
+            NodeState::new(0, true),
+            -INFINITY,
+            INFINITY,
+            &mut search,
+            &mut first_pv,
+        )
+        .unwrap();
         assert!(search.context.nodes > 1);
 
         search.context.nodes = 0;
         let mut second_pv = PvLine::default();
-        let second_score = negamax(&mut board, 3, 0, -INFINITY, INFINITY, &mut search, &mut second_pv).unwrap();
+        let second_score = negamax(
+            &mut board,
+            3,
+            NodeState::new(0, true),
+            -INFINITY,
+            INFINITY,
+            &mut search,
+            &mut second_pv,
+        )
+        .unwrap();
 
         assert_eq!(second_score, first_score);
         assert_eq!(search.context.nodes, 1);
@@ -685,7 +793,7 @@ mod tests {
         let mut search = unlimited_search(&stop);
         let mut pv = PvLine::default();
 
-        let score = negamax(&mut board, 2, 1, -50, 50, &mut search, &mut pv).unwrap();
+        let score = negamax(&mut board, 2, NodeState::new(1, true), -50, 50, &mut search, &mut pv).unwrap();
 
         assert_eq!(score, evaluation::evaluate(&board));
         assert_eq!(search.context.nodes, 1);
@@ -699,10 +807,52 @@ mod tests {
         let mut search = unlimited_search(&stop);
         let mut pv = PvLine::default();
 
-        let score = negamax(&mut board, 2, 0, -50, 50, &mut search, &mut pv).unwrap();
+        let score = negamax(&mut board, 2, NodeState::new(0, true), -50, 50, &mut search, &mut pv).unwrap();
 
         assert!(score > 50);
         assert_eq!(search.context.rfp_prunes, 0);
+    }
+
+    #[test]
+    fn null_move_prunes_deep_non_root_fail_highs() {
+        let original = Board::from_fen("4k3/8/8/8/8/8/3Q4/4K3 w - - 0 1").unwrap();
+        let mut board = original.clone();
+        let stop = AtomicBool::new(false);
+        let mut search = unlimited_search(&stop);
+        let mut pv = PvLine::default();
+
+        let score = negamax(&mut board, 5, NodeState::new(1, true), -50, 50, &mut search, &mut pv).unwrap();
+
+        assert!(score >= 50);
+        assert_eq!(board, original);
+        assert!(search.context.nmp_prunes > 0);
+    }
+
+    #[test]
+    fn null_move_pruning_requires_permission_and_non_pawn_material() {
+        let queen = Board::from_fen("4k3/8/8/8/8/8/3Q4/4K3 w - - 0 1").unwrap();
+        let pawns = Board::from_fen("4k3/8/8/8/8/8/3P4/4K3 w - - 0 1").unwrap();
+
+        assert!(has_non_pawn_material(&queen, Color::White));
+        assert!(!has_non_pawn_material(&pawns, Color::White));
+        assert!(!can_null_move_prune(
+            &queen,
+            5,
+            1,
+            false,
+            50,
+            evaluation::evaluate(&queen),
+            false,
+        ));
+        assert!(!can_null_move_prune(
+            &pawns,
+            5,
+            1,
+            false,
+            -100,
+            evaluation::evaluate(&pawns),
+            true,
+        ));
     }
 
     #[test]
@@ -712,7 +862,16 @@ mod tests {
         let mut search = unlimited_search(&stop);
         let mut pv = PvLine::default();
 
-        negamax(&mut board, 1, 0, -INFINITY, INFINITY, &mut search, &mut pv).unwrap();
+        negamax(
+            &mut board,
+            1,
+            NodeState::new(0, true),
+            -INFINITY,
+            INFINITY,
+            &mut search,
+            &mut pv,
+        )
+        .unwrap();
 
         assert!(search.context.pvs_researches > 0);
         assert_eq!(pv.moves[0], Move::new("b1".parse().unwrap(), "c3".parse().unwrap()));

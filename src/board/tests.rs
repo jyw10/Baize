@@ -87,6 +87,23 @@ fn every_starting_move_round_trips_state() {
 }
 
 #[test]
+fn null_move_round_trips_state_and_clears_en_passant() {
+    let original = Board::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 17 42").unwrap();
+    let mut board = original.clone();
+
+    let undo = board.make_null_move();
+
+    assert!(board.validate());
+    assert_eq!(board.side_to_move(), Color::Black);
+    assert_eq!(board.en_passant(), None);
+    assert_eq!(undo.delta().removed().count(), 0);
+    assert_eq!(undo.delta().added().count(), 0);
+
+    board.unmake_move(undo);
+    assert_eq!(board, original);
+}
+
+#[test]
 fn castling_uses_king_takes_rook_encoding_and_delta() {
     let original = Board::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1").unwrap();
     let kingside = Move::new_castling(Square::E1, Square::H1);
