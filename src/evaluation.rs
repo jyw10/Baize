@@ -11,6 +11,11 @@ const ISOLATED_PAWN_MG: i32 = -10;
 const ISOLATED_PAWN_EG: i32 = -8;
 const PASSED_PAWN_MG_BY_RANK: [i32; 8] = [0, 4, 8, 14, 24, 40, 70, 0];
 const PASSED_PAWN_EG_BY_RANK: [i32; 8] = [0, 8, 16, 28, 48, 80, 130, 0];
+const MOBILITY_MG: [i32; 6] = [0, 4, 4, 2, 1, 0];
+const MOBILITY_EG: [i32; 6] = [0, 2, 3, 3, 2, 0];
+const KNIGHT_OFFSETS: [(i8, i8); 8] = [(-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)];
+const BISHOP_DIRECTIONS: [(i8, i8); 4] = [(-1, -1), (-1, 1), (1, -1), (1, 1)];
+const ROOK_DIRECTIONS: [(i8, i8); 4] = [(-1, 0), (0, -1), (0, 1), (1, 0)];
 
 type HalfBoardTable = [[i32; 4]; 8];
 
@@ -141,7 +146,7 @@ const ENDGAME_TABLES: [HalfBoardTable; 6] = [
     ],
 ];
 
-/// Returns a tapered material and piece-square score from the side-to-move's perspective.
+/// Returns a tapered static evaluation from the side-to-move's perspective.
 #[must_use]
 pub fn evaluate(board: &Board) -> i32 {
     let mut middlegame = 0;
@@ -158,6 +163,9 @@ pub fn evaluate(board: &Board) -> i32 {
     let (pawn_middlegame, pawn_endgame) = pawn_structure(board);
     middlegame += pawn_middlegame;
     endgame += pawn_endgame;
+    let (mobility_middlegame, mobility_endgame) = piece_mobility(board);
+    middlegame += mobility_middlegame;
+    endgame += mobility_endgame;
 
     let phase = game_phase(board);
     let white_relative = (middlegame * phase + endgame * (MAX_PHASE - phase)) / MAX_PHASE;
@@ -208,6 +216,65 @@ fn pawn_structure(board: &Board) -> (i32, i32) {
     }
 
     (middlegame, endgame)
+}
+
+fn piece_mobility(board: &Board) -> (i32, i32) {
+    let mut middlegame = 0;
+    let mut endgame = 0;
+
+    for color in Color::ALL {
+        let sign = if color == Color::White { 1 } else { -1 };
+        for kind in [PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen] {
+            let count = BitboardIter(board.colored_pieces(color, kind))
+                .map(|from| mobility_count(board, color, kind, from))
+                .sum::<i32>();
+            middlegame += sign * MOBILITY_MG[kind.index()] * count;
+            endgame += sign * MOBILITY_EG[kind.index()] * count;
+        }
+    }
+
+    (middlegame, endgame)
+}
+
+fn mobility_count(board: &Board, color: Color, kind: PieceType, from: Square) -> i32 {
+    match kind {
+        PieceType::Knight => leaper_mobility(board, color, from, &KNIGHT_OFFSETS),
+        PieceType::Bishop => slider_mobility(board, color, from, &BISHOP_DIRECTIONS),
+        PieceType::Rook => slider_mobility(board, color, from, &ROOK_DIRECTIONS),
+        PieceType::Queen => {
+            slider_mobility(board, color, from, &BISHOP_DIRECTIONS)
+                + slider_mobility(board, color, from, &ROOK_DIRECTIONS)
+        }
+        PieceType::Pawn | PieceType::King => 0,
+    }
+}
+
+fn leaper_mobility(board: &Board, color: Color, from: Square, offsets: &[(i8, i8)]) -> i32 {
+    offsets
+        .iter()
+        .filter(|&&(file_delta, rank_delta)| {
+            from.offset(file_delta, rank_delta)
+                .is_some_and(|to| board.piece_at(to).is_none_or(|piece| piece.color != color))
+        })
+        .count() as i32
+}
+
+fn slider_mobility(board: &Board, color: Color, from: Square, directions: &[(i8, i8)]) -> i32 {
+    let mut count = 0;
+    for &(file_delta, rank_delta) in directions {
+        let mut cursor = from;
+        while let Some(to) = cursor.offset(file_delta, rank_delta) {
+            cursor = to;
+            if let Some(piece) = board.piece_at(to) {
+                if piece.color != color {
+                    count += 1;
+                }
+                break;
+            }
+            count += 1;
+        }
+    }
+    count
 }
 
 fn pawn_file_counts(pawns: u64) -> [u8; 8] {
@@ -278,6 +345,13 @@ mod tests {
     }
 
     #[test]
+    fn black_mobility_mirrors_white_mobility() {
+        let white = Board::from_fen("4k3/8/8/8/3B4/8/8/4K3 w - - 0 1").unwrap();
+        let black = Board::from_fen("4k3/8/8/3b4/8/8/8/4K3 b - - 0 1").unwrap();
+        assert_eq!(evaluate(&white), evaluate(&black));
+    }
+
+    #[test]
     fn phase_is_bounded_by_normal_starting_material() {
         assert_eq!(game_phase(&Board::starting_position()), MAX_PHASE);
         let kings = Board::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
@@ -299,6 +373,25 @@ mod tests {
         let center = Board::from_fen("4k3/8/8/8/3K4/8/8/8 w - - 0 1").unwrap();
         let corner = Board::from_fen("4k3/8/8/8/8/8/8/K7 w - - 0 1").unwrap();
         assert!(evaluate(&center) > evaluate(&corner));
+    }
+
+    #[test]
+    fn knight_mobility_rewards_more_available_squares() {
+        let open = Board::from_fen("4k3/8/8/8/3N4/8/8/4K3 w - - 0 1").unwrap();
+        let blocked = Board::from_fen("4k3/8/2P1P3/1P3P2/3N4/1P3P2/2P1P3/4K3 w - - 0 1").unwrap();
+
+        assert!(piece_mobility(&open).0 > piece_mobility(&blocked).0);
+        assert!(piece_mobility(&open).1 > piece_mobility(&blocked).1);
+    }
+
+    #[test]
+    fn slider_mobility_counts_open_lines_until_blocked() {
+        let open = Board::from_fen("4k3/8/8/8/3R4/8/8/4K3 w - - 0 1").unwrap();
+        let blocked = Board::from_fen("4k3/8/8/3P4/2PRP3/8/8/4K3 w - - 0 1").unwrap();
+
+        assert_eq!(piece_mobility(&open), (28, 42));
+        assert!(piece_mobility(&open).0 > piece_mobility(&blocked).0);
+        assert!(piece_mobility(&open).1 > piece_mobility(&blocked).1);
     }
 
     #[test]
