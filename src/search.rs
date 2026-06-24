@@ -17,6 +17,8 @@ pub const MAX_HASH_MB: usize = 65_536;
 const INFINITY: i32 = 32_000;
 const ASPIRATION_WINDOW: i32 = 25;
 const HISTORY_MAX: i32 = 16_384;
+const RFP_MAX_DEPTH: u8 = 4;
+const RFP_MARGIN_PER_DEPTH: i32 = 80;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SearchLimits {
@@ -96,6 +98,8 @@ struct SearchContext<'a> {
     pvs_researches: u64,
     #[cfg(test)]
     aspiration_researches: u64,
+    #[cfg(test)]
+    rfp_prunes: u64,
 }
 
 impl SearchContext<'_> {
@@ -179,6 +183,8 @@ pub fn iterative_deepening(
             pvs_researches: 0,
             #[cfg(test)]
             aspiration_researches: 0,
+            #[cfg(test)]
+            rfp_prunes: 0,
         },
         table,
         history: ButterflyHistory::default(),
@@ -281,13 +287,10 @@ fn negamax(
     search.context.enter_node()?;
     pv.len = 0;
 
+    let in_check = board.is_in_check(board.side_to_move());
     let mut moves = board.legal_moves();
     if moves.is_empty() {
-        return Ok(if board.is_in_check(board.side_to_move()) {
-            -MATE_SCORE + ply as i32
-        } else {
-            0
-        });
+        return Ok(if in_check { -MATE_SCORE + ply as i32 } else { 0 });
     }
     if board.is_fifty_move_draw() || board.is_threefold_repetition() || board.is_insufficient_material() {
         return Ok(0);
@@ -300,6 +303,14 @@ fn negamax(
     let entry = search.table.probe(key);
     if let Some(score) = entry.and_then(|stored| tt_cutoff(stored, depth, ply, alpha, beta)) {
         return Ok(score);
+    }
+    let static_eval = evaluation::evaluate(board);
+    if can_reverse_futility_prune(depth, ply, in_check, beta) && static_eval - reverse_futility_margin(depth) >= beta {
+        #[cfg(test)]
+        {
+            search.context.rfp_prunes += 1;
+        }
+        return Ok(static_eval);
     }
     let alpha_start = alpha;
 
@@ -461,6 +472,14 @@ fn is_quiet(board: &Board, mv: Move) -> bool {
     mv.promotion().is_none() && mvv_lva_score(board, mv) == 0
 }
 
+fn can_reverse_futility_prune(depth: u8, ply: usize, in_check: bool, beta: i32) -> bool {
+    ply > 0 && depth <= RFP_MAX_DEPTH && !in_check && beta.abs() < MATE_SCORE - MAX_PLY as i32
+}
+
+fn reverse_futility_margin(depth: u8) -> i32 {
+    RFP_MARGIN_PER_DEPTH * i32::from(depth)
+}
+
 fn tt_cutoff(entry: Entry, depth: u8, ply: usize, alpha: i32, beta: i32) -> Option<i32> {
     if entry.depth < depth {
         return None;
@@ -552,6 +571,7 @@ mod tests {
                 nodes: 0,
                 pvs_researches: 0,
                 aspiration_researches: 0,
+                rfp_prunes: 0,
             },
             table: TranspositionTable::new(64 * 1024),
             history: ButterflyHistory::default(),
@@ -656,6 +676,33 @@ mod tests {
 
         assert_eq!(aspiration_score, full_score);
         assert!(aspiration_search.context.aspiration_researches > 0);
+    }
+
+    #[test]
+    fn reverse_futility_prunes_shallow_non_root_nodes() {
+        let mut board = Board::from_fen("4k3/8/8/8/8/8/4Q3/4K3 w - - 0 1").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut search = unlimited_search(&stop);
+        let mut pv = PvLine::default();
+
+        let score = negamax(&mut board, 2, 1, -50, 50, &mut search, &mut pv).unwrap();
+
+        assert_eq!(score, evaluation::evaluate(&board));
+        assert_eq!(search.context.nodes, 1);
+        assert_eq!(search.context.rfp_prunes, 1);
+    }
+
+    #[test]
+    fn reverse_futility_does_not_prune_root_nodes() {
+        let mut board = Board::from_fen("4k3/8/8/8/8/8/4Q3/4K3 w - - 0 1").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut search = unlimited_search(&stop);
+        let mut pv = PvLine::default();
+
+        let score = negamax(&mut board, 2, 0, -50, 50, &mut search, &mut pv).unwrap();
+
+        assert!(score > 50);
+        assert_eq!(search.context.rfp_prunes, 0);
     }
 
     #[test]
