@@ -1,4 +1,4 @@
-use crate::{Board, Color, PieceType, Square, types::BitboardIter};
+use crate::{Board, Color, Piece, PieceType, Square, types::BitboardIter};
 
 const MAX_PHASE: i32 = 24;
 const PHASE_WEIGHTS: [i32; 6] = [0, 1, 1, 2, 4, 0];
@@ -13,11 +13,62 @@ const PASSED_PAWN_MG_BY_RANK: [i32; 8] = [0, 4, 8, 14, 24, 40, 70, 0];
 const PASSED_PAWN_EG_BY_RANK: [i32; 8] = [0, 8, 16, 28, 48, 80, 130, 0];
 const MOBILITY_MG: [i32; 6] = [0, 4, 4, 2, 1, 0];
 const MOBILITY_EG: [i32; 6] = [0, 2, 3, 3, 2, 0];
-const KNIGHT_OFFSETS: [(i8, i8); 8] = [(-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)];
 const BISHOP_DIRECTIONS: [(i8, i8); 4] = [(-1, -1), (-1, 1), (1, -1), (1, 1)];
 const ROOK_DIRECTIONS: [(i8, i8); 4] = [(-1, 0), (0, -1), (0, 1), (1, 0)];
+const FILE_MASKS: [u64; 8] = [
+    0x0101_0101_0101_0101,
+    0x0202_0202_0202_0202,
+    0x0404_0404_0404_0404,
+    0x0808_0808_0808_0808,
+    0x1010_1010_1010_1010,
+    0x2020_2020_2020_2020,
+    0x4040_4040_4040_4040,
+    0x8080_8080_8080_8080,
+];
+const ADJACENT_FILE_MASKS: [u64; 8] = [
+    FILE_MASKS[1],
+    FILE_MASKS[0] | FILE_MASKS[2],
+    FILE_MASKS[1] | FILE_MASKS[3],
+    FILE_MASKS[2] | FILE_MASKS[4],
+    FILE_MASKS[3] | FILE_MASKS[5],
+    FILE_MASKS[4] | FILE_MASKS[6],
+    FILE_MASKS[5] | FILE_MASKS[7],
+    FILE_MASKS[6],
+];
+const WHITE_PASSED_PAWN_BLOCKERS: [u64; 64] = passed_pawn_blockers(true);
+const BLACK_PASSED_PAWN_BLOCKERS: [u64; 64] = passed_pawn_blockers(false);
+const KNIGHT_ATTACKS: [u64; 64] = knight_attacks();
 
 type HalfBoardTable = [[i32; 4]; 8];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EvalState {
+    middlegame: i32,
+    endgame: i32,
+    phase: i32,
+}
+
+impl EvalState {
+    pub(crate) const fn new(middlegame: i32, endgame: i32, phase: i32) -> Self {
+        Self {
+            middlegame,
+            endgame,
+            phase,
+        }
+    }
+
+    pub(crate) fn add(&mut self, other: Self) {
+        self.middlegame += other.middlegame;
+        self.endgame += other.endgame;
+        self.phase += other.phase;
+    }
+
+    pub(crate) fn subtract(&mut self, other: Self) {
+        self.middlegame -= other.middlegame;
+        self.endgame -= other.endgame;
+        self.phase -= other.phase;
+    }
+}
 
 // Tables are indexed from White's first rank and mirrored across the files.
 const MIDDLEGAME_TABLES: [HalfBoardTable; 6] = [
@@ -149,17 +200,10 @@ const ENDGAME_TABLES: [HalfBoardTable; 6] = [
 /// Returns a tapered static evaluation from the side-to-move's perspective.
 #[must_use]
 pub fn evaluate(board: &Board) -> i32 {
-    let mut middlegame = 0;
-    let mut endgame = 0;
+    let core = board.core_eval();
+    let mut middlegame = core.middlegame;
+    let mut endgame = core.endgame;
 
-    for square in board.occupied_squares() {
-        let piece = board.piece_at(square).expect("occupied square contains a piece");
-        let relative_square = relative_square(piece.color, square);
-        let sign = if piece.color == Color::White { 1 } else { -1 };
-        let kind = piece.kind.index();
-        middlegame += sign * (MIDDLEGAME_VALUES[kind] + table_value(&MIDDLEGAME_TABLES[kind], relative_square));
-        endgame += sign * (ENDGAME_VALUES[kind] + table_value(&ENDGAME_TABLES[kind], relative_square));
-    }
     let (pawn_middlegame, pawn_endgame) = pawn_structure(board);
     middlegame += pawn_middlegame;
     endgame += pawn_endgame;
@@ -167,7 +211,7 @@ pub fn evaluate(board: &Board) -> i32 {
     middlegame += mobility_middlegame;
     endgame += mobility_endgame;
 
-    let phase = game_phase(board);
+    let phase = core.phase.min(MAX_PHASE);
     let white_relative = (middlegame * phase + endgame * (MAX_PHASE - phase)) / MAX_PHASE;
     if board.side_to_move() == Color::White {
         white_relative
@@ -176,12 +220,31 @@ pub fn evaluate(board: &Board) -> i32 {
     }
 }
 
+pub(crate) fn piece_core_eval(piece: Piece, square: Square) -> EvalState {
+    let relative_square = relative_square(piece.color, square);
+    let sign = if piece.color == Color::White { 1 } else { -1 };
+    let kind = piece.kind.index();
+    EvalState::new(
+        sign * (MIDDLEGAME_VALUES[kind] + table_value(&MIDDLEGAME_TABLES[kind], relative_square)),
+        sign * (ENDGAME_VALUES[kind] + table_value(&ENDGAME_TABLES[kind], relative_square)),
+        PHASE_WEIGHTS[kind],
+    )
+}
+
+pub(crate) fn recompute_core_eval(board: &Board) -> EvalState {
+    let mut eval = EvalState::default();
+    for square in board.occupied_squares() {
+        eval.add(piece_core_eval(
+            board.piece_at(square).expect("occupied square contains a piece"),
+            square,
+        ));
+    }
+    eval
+}
+
+#[cfg(test)]
 fn game_phase(board: &Board) -> i32 {
-    PieceType::ALL
-        .into_iter()
-        .map(|kind| PHASE_WEIGHTS[kind.index()] * board.pieces(kind).count_ones() as i32)
-        .sum::<i32>()
-        .min(MAX_PHASE)
+    recompute_core_eval(board).phase.min(MAX_PHASE)
 }
 
 fn pawn_structure(board: &Board) -> (i32, i32) {
@@ -203,7 +266,7 @@ fn pawn_structure(board: &Board) -> (i32, i32) {
 
         let enemy_pawns = board.colored_pieces(!color, PieceType::Pawn);
         for square in BitboardIter(pawns) {
-            if is_isolated_pawn(square.file(), &file_counts) {
+            if is_isolated_pawn(square.file(), pawns) {
                 middlegame += sign * ISOLATED_PAWN_MG;
                 endgame += sign * ISOLATED_PAWN_EG;
             }
@@ -238,7 +301,7 @@ fn piece_mobility(board: &Board) -> (i32, i32) {
 
 fn mobility_count(board: &Board, color: Color, kind: PieceType, from: Square) -> i32 {
     match kind {
-        PieceType::Knight => leaper_mobility(board, color, from, &KNIGHT_OFFSETS),
+        PieceType::Knight => knight_mobility(board, color, from),
         PieceType::Bishop => slider_mobility(board, color, from, &BISHOP_DIRECTIONS),
         PieceType::Rook => slider_mobility(board, color, from, &ROOK_DIRECTIONS),
         PieceType::Queen => {
@@ -249,14 +312,8 @@ fn mobility_count(board: &Board, color: Color, kind: PieceType, from: Square) ->
     }
 }
 
-fn leaper_mobility(board: &Board, color: Color, from: Square, offsets: &[(i8, i8)]) -> i32 {
-    offsets
-        .iter()
-        .filter(|&&(file_delta, rank_delta)| {
-            from.offset(file_delta, rank_delta)
-                .is_some_and(|to| board.piece_at(to).is_none_or(|piece| piece.color != color))
-        })
-        .count() as i32
+fn knight_mobility(board: &Board, color: Color, from: Square) -> i32 {
+    (KNIGHT_ATTACKS[from.index()] & !board.colors(color)).count_ones() as i32
 }
 
 fn slider_mobility(board: &Board, color: Color, from: Square, directions: &[(i8, i8)]) -> i32 {
@@ -285,20 +342,16 @@ fn pawn_file_counts(pawns: u64) -> [u8; 8] {
     counts
 }
 
-fn is_isolated_pawn(file: u8, file_counts: &[u8; 8]) -> bool {
-    let left_empty = file == 0 || file_counts[file as usize - 1] == 0;
-    let right_empty = file == 7 || file_counts[file as usize + 1] == 0;
-    left_empty && right_empty
+fn is_isolated_pawn(file: u8, friendly_pawns: u64) -> bool {
+    friendly_pawns & ADJACENT_FILE_MASKS[file as usize] == 0
 }
 
 fn is_passed_pawn(color: Color, square: Square, enemy_pawns: u64) -> bool {
-    BitboardIter(enemy_pawns).all(|enemy| {
-        enemy.file().abs_diff(square.file()) > 1
-            || match color {
-                Color::White => enemy.rank() <= square.rank(),
-                Color::Black => enemy.rank() >= square.rank(),
-            }
-    })
+    let blockers = match color {
+        Color::White => WHITE_PASSED_PAWN_BLOCKERS[square.index()],
+        Color::Black => BLACK_PASSED_PAWN_BLOCKERS[square.index()],
+    };
+    enemy_pawns & blockers == 0
 }
 
 const fn relative_square(color: Color, square: Square) -> Square {
@@ -311,6 +364,73 @@ const fn relative_square(color: Color, square: Square) -> Square {
 fn table_value(table: &HalfBoardTable, square: Square) -> i32 {
     let file = square.file().min(7 - square.file()) as usize;
     table[square.rank() as usize][file]
+}
+
+const fn passed_pawn_blockers(white: bool) -> [u64; 64] {
+    let mut masks = [0; 64];
+    let mut square = 0;
+    while square < 64 {
+        masks[square] = passed_pawn_blocker_mask(white, square as u8);
+        square += 1;
+    }
+    masks
+}
+
+const fn passed_pawn_blocker_mask(white: bool, square: u8) -> u64 {
+    let file = square & 7;
+    let rank = square >> 3;
+    let first_file = if file == 0 { 0 } else { file - 1 };
+    let last_file = if file == 7 { 7 } else { file + 1 };
+    let mut mask = 0;
+
+    let mut current_file = first_file;
+    while current_file <= last_file {
+        if white {
+            let mut current_rank = rank + 1;
+            while current_rank < 8 {
+                mask |= 1_u64 << (current_rank * 8 + current_file);
+                current_rank += 1;
+            }
+        } else {
+            let mut current_rank = 0;
+            while current_rank < rank {
+                mask |= 1_u64 << (current_rank * 8 + current_file);
+                current_rank += 1;
+            }
+        }
+        current_file += 1;
+    }
+
+    mask
+}
+
+const fn knight_attacks() -> [u64; 64] {
+    let mut attacks = [0; 64];
+    let mut square = 0;
+    while square < 64 {
+        attacks[square] = knight_attack_mask(square as u8);
+        square += 1;
+    }
+    attacks
+}
+
+const fn knight_attack_mask(square: u8) -> u64 {
+    const FILE_DELTAS: [i8; 8] = [-2, -2, -1, -1, 1, 1, 2, 2];
+    const RANK_DELTAS: [i8; 8] = [-1, 1, -2, 2, -2, 2, -1, 1];
+
+    let file = (square & 7) as i8;
+    let rank = (square >> 3) as i8;
+    let mut mask = 0;
+    let mut index = 0;
+    while index < 8 {
+        let target_file = file + FILE_DELTAS[index];
+        let target_rank = rank + RANK_DELTAS[index];
+        if target_file >= 0 && target_file < 8 && target_rank >= 0 && target_rank < 8 {
+            mask |= 1_u64 << ((target_rank as u8) * 8 + target_file as u8);
+        }
+        index += 1;
+    }
+    mask
 }
 
 #[cfg(test)]

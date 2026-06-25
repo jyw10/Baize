@@ -1,4 +1,4 @@
-use crate::{Board, Color, GameStatus, Move, MoveKind, Piece, PieceType, Square, tools::perft};
+use crate::{Board, Color, GameStatus, Move, MoveKind, Piece, PieceType, Square, evaluation, tools::perft};
 
 #[test]
 fn fen_round_trip() {
@@ -87,6 +87,34 @@ fn every_starting_move_round_trips_state() {
 }
 
 #[test]
+fn cached_core_eval_matches_reference_recompute_for_fens() {
+    for fen in [
+        Board::STARTING_FEN,
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "4rrk1/ppp2ppp/2n5/3q4/3P4/2P2N2/PP3PPP/R2Q1RK1 w - - 0 16",
+        "k6r/6P1/8/8/8/8/8/7K w - - 0 1",
+        "4k3/8/8/3pP3/8/8/8/4K3 w - d6 17 42",
+        "4k3/QQQQQQQQ/8/8/8/8/qqqqqqqq/4K3 w - - 0 1",
+    ] {
+        let board = Board::from_fen(fen).unwrap();
+        assert_core_eval_cache(&board);
+    }
+}
+
+#[test]
+fn eval_cache_round_trips_recursively() {
+    for fen in [
+        Board::STARTING_FEN,
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1",
+        "4k3/P7/8/8/8/8/8/4K3 w - - 0 1",
+    ] {
+        let mut board = Board::from_fen(fen).unwrap();
+        verify_eval_cache_recursively(&mut board, 2);
+    }
+}
+
+#[test]
 fn pseudo_legal_filtering_matches_legal_moves() {
     for fen in [
         Board::STARTING_FEN,
@@ -128,10 +156,13 @@ fn pseudo_tacticals_match_current_quiescence_tactical_set() {
 fn null_move_round_trips_state_and_clears_en_passant() {
     let original = Board::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 17 42").unwrap();
     let mut board = original.clone();
+    let original_eval = evaluation::evaluate(&board);
 
     let undo = board.make_null_move();
 
     assert!(board.validate());
+    assert_core_eval_cache(&board);
+    assert_eq!(evaluation::evaluate(&board), -original_eval);
     assert_eq!(board.side_to_move(), Color::Black);
     assert_eq!(board.en_passant(), None);
     assert_eq!(undo.delta().removed().count(), 0);
@@ -248,6 +279,34 @@ fn feature_counts(board: &Board) -> [[u8; 64]; 12] {
         result[piece.zobrist_index()][square.index()] += 1;
     }
     result
+}
+
+fn assert_core_eval_cache(board: &Board) {
+    assert_eq!(board.core_eval(), evaluation::recompute_core_eval(board));
+    assert!(board.validate());
+}
+
+fn verify_eval_cache_recursively(board: &mut Board, depth: u8) {
+    assert_core_eval_cache(board);
+    if depth == 0 {
+        return;
+    }
+
+    let original = board.clone();
+    let original_eval = evaluation::evaluate(board);
+    for mv in board.legal_moves() {
+        let undo = board.make_move(mv).unwrap();
+        assert_core_eval_cache(board);
+        verify_eval_cache_recursively(board, depth - 1);
+        board.unmake_move(undo);
+        assert_core_eval_cache(board);
+        assert_eq!(*board, original, "bad eval cache restoration after {mv}");
+        assert_eq!(
+            evaluation::evaluate(board),
+            original_eval,
+            "bad eval restoration after {mv}"
+        );
+    }
 }
 
 fn legal_from_pseudo(board: &Board, moves: Vec<Move>) -> Vec<Move> {

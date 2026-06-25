@@ -1,6 +1,9 @@
 use std::fmt;
 
-use crate::types::{Bitboard, BitboardIter, CastlingRights, Color, Piece, PieceOnSquare, PieceType, Square};
+use crate::{
+    evaluation::{self, EvalState},
+    types::{Bitboard, BitboardIter, CastlingRights, Color, Piece, PieceOnSquare, PieceType, Square},
+};
 
 mod fen;
 mod makemove;
@@ -42,6 +45,7 @@ pub struct Board {
     colors: [Bitboard; 2],
     mailbox: [Option<Piece>; 64],
     state: PositionState,
+    eval: EvalState,
     hash_history: Vec<u64>,
 }
 
@@ -66,6 +70,7 @@ impl Board {
             colors: [0; 2],
             mailbox: [None; 64],
             state: PositionState::default(),
+            eval: EvalState::default(),
             hash_history: Vec::new(),
         }
     }
@@ -140,12 +145,18 @@ impl Board {
         }
     }
 
+    #[must_use]
+    pub(crate) const fn core_eval(&self) -> EvalState {
+        self.eval
+    }
+
     fn add_piece_raw(&mut self, piece: Piece, square: Square) {
         debug_assert!(self.mailbox[square.index()].is_none());
         self.mailbox[square.index()] = Some(piece);
         self.pieces[piece.kind.index()] |= square.bit();
         self.colors[piece.color.index()] |= square.bit();
         self.state.hash ^= zobrist::piece(piece, square);
+        self.eval.add(evaluation::piece_core_eval(piece, square));
     }
 
     fn remove_piece_raw(&mut self, square: Square) -> Option<Piece> {
@@ -153,6 +164,7 @@ impl Board {
         self.pieces[piece.kind.index()] &= !square.bit();
         self.colors[piece.color.index()] &= !square.bit();
         self.state.hash ^= zobrist::piece(piece, square);
+        self.eval.subtract(evaluation::piece_core_eval(piece, square));
         Some(piece)
     }
 
@@ -190,6 +202,7 @@ impl Board {
 
     pub(crate) fn reset_history_and_hash(&mut self) {
         self.state.hash = self.recompute_hash();
+        self.eval = evaluation::recompute_core_eval(self);
         self.hash_history.clear();
         self.hash_history.push(self.state.hash);
     }
@@ -272,6 +285,7 @@ impl Board {
             && self.king_square(Color::White).is_some()
             && self.king_square(Color::Black).is_some()
             && self.recompute_hash() == self.hash()
+            && evaluation::recompute_core_eval(self) == self.core_eval()
             && self.hash_history.last().copied() == Some(self.hash())
     }
 }
