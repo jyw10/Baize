@@ -81,7 +81,7 @@ impl Board {
         false
     }
 
-    fn pseudo_legal_moves(&self) -> Vec<Move> {
+    pub(crate) fn pseudo_legal_moves(&self) -> Vec<Move> {
         let mut moves = Vec::with_capacity(64);
         let side = self.side_to_move();
         self.generate_pawns(side, &mut moves);
@@ -92,6 +92,19 @@ impl Board {
         self.generate_sliders(side, PieceType::Queen, &ROOK_DIRECTIONS, &mut moves);
         self.generate_leapers(side, PieceType::King, &KING_OFFSETS, &mut moves);
         self.generate_castling(side, &mut moves);
+        moves
+    }
+
+    pub(crate) fn pseudo_tactical_moves(&self) -> Vec<Move> {
+        let mut moves = Vec::with_capacity(32);
+        let side = self.side_to_move();
+        self.generate_pawn_tacticals(side, &mut moves);
+        self.generate_leaper_captures(side, PieceType::Knight, &KNIGHT_OFFSETS, &mut moves);
+        self.generate_slider_captures(side, PieceType::Bishop, &BISHOP_DIRECTIONS, &mut moves);
+        self.generate_slider_captures(side, PieceType::Rook, &ROOK_DIRECTIONS, &mut moves);
+        self.generate_slider_captures(side, PieceType::Queen, &BISHOP_DIRECTIONS, &mut moves);
+        self.generate_slider_captures(side, PieceType::Queen, &ROOK_DIRECTIONS, &mut moves);
+        self.generate_leaper_captures(side, PieceType::King, &KING_OFFSETS, &mut moves);
         moves
     }
 
@@ -109,6 +122,33 @@ impl Board {
                 {
                     moves.push(Move::new(from, double_to));
                 }
+            }
+
+            for file_delta in [-1, 1] {
+                let Some(to) = from.offset(file_delta, rank_delta) else {
+                    continue;
+                };
+                if self
+                    .piece_at(to)
+                    .is_some_and(|piece| piece.color != side && piece.kind != PieceType::King)
+                {
+                    self.push_pawn_move(from, to, side, moves);
+                } else if Some(to) == self.en_passant() {
+                    moves.push(Move::new_en_passant(from, to));
+                }
+            }
+        }
+    }
+
+    fn generate_pawn_tacticals(&self, side: Color, moves: &mut Vec<Move>) {
+        for from in BitboardIter(self.colored_pieces(side, PieceType::Pawn)) {
+            let rank_delta = side.pawn_push() / 8;
+            let promotion_rank = if side == Color::White { 7 } else { 0 };
+            if let Some(to) = from.offset(0, rank_delta)
+                && to.rank() == promotion_rank
+                && self.piece_at(to).is_none()
+            {
+                self.push_pawn_move(from, to, side, moves);
             }
 
             for file_delta in [-1, 1] {
@@ -156,6 +196,22 @@ impl Board {
         }
     }
 
+    fn generate_leaper_captures(&self, side: Color, kind: PieceType, offsets: &[(i8, i8)], moves: &mut Vec<Move>) {
+        for from in BitboardIter(self.colored_pieces(side, kind)) {
+            for &(file_delta, rank_delta) in offsets {
+                let Some(to) = from.offset(file_delta, rank_delta) else {
+                    continue;
+                };
+                if self
+                    .piece_at(to)
+                    .is_some_and(|piece| piece.color != side && piece.kind != PieceType::King)
+                {
+                    moves.push(Move::new(from, to));
+                }
+            }
+        }
+    }
+
     fn generate_sliders(&self, side: Color, kind: PieceType, directions: &[(i8, i8)], moves: &mut Vec<Move>) {
         for from in BitboardIter(self.colored_pieces(side, kind)) {
             for &(file_delta, rank_delta) in directions {
@@ -164,6 +220,25 @@ impl Board {
                     cursor = to;
                     match self.piece_at(to) {
                         None => moves.push(Move::new(from, to)),
+                        Some(piece) if piece.color != side && piece.kind != PieceType::King => {
+                            moves.push(Move::new(from, to));
+                            break;
+                        }
+                        Some(_) => break,
+                    }
+                }
+            }
+        }
+    }
+
+    fn generate_slider_captures(&self, side: Color, kind: PieceType, directions: &[(i8, i8)], moves: &mut Vec<Move>) {
+        for from in BitboardIter(self.colored_pieces(side, kind)) {
+            for &(file_delta, rank_delta) in directions {
+                let mut cursor = from;
+                while let Some(to) = cursor.offset(file_delta, rank_delta) {
+                    cursor = to;
+                    match self.piece_at(to) {
+                        None => {}
                         Some(piece) if piece.color != side && piece.kind != PieceType::King => {
                             moves.push(Move::new(from, to));
                             break;

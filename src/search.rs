@@ -321,9 +321,10 @@ fn negamax(
     search.context.enter_node()?;
     pv.len = 0;
 
+    let side_to_move = board.side_to_move();
     let in_check = board.is_in_check(board.side_to_move());
-    let mut moves = board.legal_moves();
-    if moves.is_empty() {
+    let mut moves = board.pseudo_legal_moves();
+    if !has_legal_move(board, &moves) {
         return Ok(if in_check { -MATE_SCORE + ply as i32 } else { 0 });
     }
     if board.is_fifty_move_draw() || board.is_threefold_repetition() || board.is_insufficient_material() {
@@ -370,7 +371,6 @@ fn negamax(
     }
     let alpha_start = alpha;
 
-    let side_to_move = board.side_to_move();
     order_moves(
         board,
         &mut moves,
@@ -385,6 +385,10 @@ fn negamax(
         let undo = board
             .make_move_unchecked(mv)
             .expect("legal move must be structurally valid");
+        if board.is_in_check(side_to_move) {
+            board.unmake_move(undo);
+            continue;
+        }
         let mut child_pv = PvLine::default();
         let child = if first_move {
             negamax(board, depth - 1, node.child(true), -beta, -alpha, search, &mut child_pv).map(|score| -score)
@@ -454,9 +458,10 @@ fn quiescence(
     search.context.enter_node()?;
     pv.len = 0;
 
+    let side_to_move = board.side_to_move();
     let in_check = board.is_in_check(board.side_to_move());
-    let mut moves = board.legal_moves();
-    if moves.is_empty() {
+    let legal_probe_moves = board.pseudo_legal_moves();
+    if !has_legal_move(board, &legal_probe_moves) {
         return Ok(if in_check { -MATE_SCORE + ply as i32 } else { 0 });
     }
     if board.is_fifty_move_draw() || board.is_threefold_repetition() || board.is_insufficient_material() {
@@ -488,9 +493,13 @@ fn quiescence(
             return Ok(stand_pat);
         }
         alpha = alpha.max(stand_pat);
-        moves.retain(|&mv| is_tactical(board, mv));
     }
 
+    let mut moves = if in_check {
+        legal_probe_moves
+    } else {
+        board.pseudo_tactical_moves()
+    };
     order_moves(
         board,
         &mut moves,
@@ -501,6 +510,10 @@ fn quiescence(
         let undo = board
             .make_move_unchecked(mv)
             .expect("legal move must be structurally valid");
+        if board.is_in_check(side_to_move) {
+            board.unmake_move(undo);
+            continue;
+        }
         let mut child_pv = PvLine::default();
         let child = quiescence(board, ply + 1, -beta, -alpha, search, &mut child_pv);
         board.unmake_move(undo);
@@ -529,8 +542,19 @@ fn quiescence(
     Ok(best)
 }
 
-fn is_tactical(board: &Board, mv: Move) -> bool {
-    mv.promotion().is_some() || mvv_lva_score(board, mv) > 0
+fn has_legal_move(board: &mut Board, moves: &[Move]) -> bool {
+    let side_to_move = board.side_to_move();
+    for &mv in moves {
+        let undo = board
+            .make_move_unchecked(mv)
+            .expect("pseudo-legal move must satisfy structural move requirements");
+        let legal = !board.is_in_check(side_to_move);
+        board.unmake_move(undo);
+        if legal {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_quiet(board: &Board, mv: Move) -> bool {
@@ -683,6 +707,25 @@ mod tests {
         );
         assert_eq!(mate_moves(result.score), Some(1));
         assert!(result.best_move.is_some());
+        assert_eq!(result.completed_depth, 2);
+    }
+
+    #[test]
+    fn returns_draw_for_stalemate_root() {
+        let board = Board::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").unwrap();
+        let stop = AtomicBool::new(false);
+        let result = iterative_deepening(
+            &board,
+            SearchLimits {
+                depth: Some(2),
+                ..SearchLimits::default()
+            },
+            &stop,
+            |_| {},
+        );
+
+        assert_eq!(result.score, 0);
+        assert_eq!(result.best_move, None);
         assert_eq!(result.completed_depth, 2);
     }
 

@@ -87,6 +87,44 @@ fn every_starting_move_round_trips_state() {
 }
 
 #[test]
+fn pseudo_legal_filtering_matches_legal_moves() {
+    for fen in [
+        Board::STARTING_FEN,
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "4r1k1/8/8/8/8/8/8/4K3 w - - 0 1",
+        "k6r/6P1/8/8/8/8/8/7K w - - 0 1",
+        "k7/8/8/3pP3/8/8/8/K7 w - d6 0 1",
+        "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1",
+    ] {
+        let board = Board::from_fen(fen).unwrap();
+        assert_eq!(
+            legal_from_pseudo(&board, board.pseudo_legal_moves()),
+            board.legal_moves()
+        );
+    }
+}
+
+#[test]
+fn pseudo_tacticals_match_current_quiescence_tactical_set() {
+    for fen in [
+        "7k/P7/8/8/8/8/8/7K w - - 0 1",
+        "k6r/6P1/8/8/8/8/8/7K w - - 0 1",
+        "k7/8/8/3pP3/8/8/8/K7 w - d6 0 1",
+        "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+        "k7/8/8/3q3r/4P3/8/8/K2Q4 w - - 0 1",
+    ] {
+        let board = Board::from_fen(fen).unwrap();
+        let expected = board
+            .legal_moves()
+            .into_iter()
+            .filter(|&mv| is_current_quiescence_tactical(&board, mv))
+            .collect::<Vec<_>>();
+
+        assert_eq!(legal_from_pseudo(&board, board.pseudo_tactical_moves()), expected);
+    }
+}
+
+#[test]
 fn null_move_round_trips_state_and_clears_en_passant() {
     let original = Board::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 17 42").unwrap();
     let mut board = original.clone();
@@ -210,6 +248,26 @@ fn feature_counts(board: &Board) -> [[u8; 64]; 12] {
         result[piece.zobrist_index()][square.index()] += 1;
     }
     result
+}
+
+fn legal_from_pseudo(board: &Board, moves: Vec<Move>) -> Vec<Move> {
+    let side = board.side_to_move();
+    let mut position = board.clone();
+    let mut legal = Vec::new();
+    for mv in moves {
+        let undo = position.make_move_unchecked(mv).unwrap();
+        if !position.is_in_check(side) {
+            legal.push(mv);
+        }
+        position.unmake_move(undo);
+    }
+    legal
+}
+
+fn is_current_quiescence_tactical(board: &Board, mv: Move) -> bool {
+    mv.promotion().is_some()
+        || mv.kind() == MoveKind::EnPassant
+        || (mv.kind() != MoveKind::Castling && board.piece_at(mv.to()).is_some())
 }
 
 fn verify_deltas_recursively(board: &mut Board, depth: u8) {
