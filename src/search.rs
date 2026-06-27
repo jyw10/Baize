@@ -21,6 +21,12 @@ const RFP_MAX_DEPTH: u8 = 4;
 const RFP_MARGIN_PER_DEPTH: i32 = 80;
 const NMP_MIN_DEPTH: u8 = 3;
 const NMP_REDUCTION: u8 = 2;
+const LMR_MIN_DEPTH: u8 = 3;
+const LMR_MIN_MOVE_NUMBER: usize = 4;
+const LMR_MAX_DEPTH_INDEX: usize = MAX_PLY - 1;
+const LMR_MAX_MOVE_INDEX: usize = 255;
+const LMR_DIVISOR: f64 = 2.25;
+const LMR_HIGH_HISTORY_THRESHOLD: i32 = HISTORY_MAX / 4;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SearchLimits {
@@ -104,6 +110,10 @@ struct SearchContext<'a> {
     rfp_prunes: u64,
     #[cfg(test)]
     nmp_prunes: u64,
+    #[cfg(test)]
+    lmr_reductions: u64,
+    #[cfg(test)]
+    lmr_researches: u64,
 }
 
 impl SearchContext<'_> {
@@ -210,6 +220,10 @@ pub fn iterative_deepening(
             rfp_prunes: 0,
             #[cfg(test)]
             nmp_prunes: 0,
+            #[cfg(test)]
+            lmr_reductions: 0,
+            #[cfg(test)]
+            lmr_researches: 0,
         },
         table,
         history: ButterflyHistory::default(),
@@ -380,8 +394,10 @@ fn negamax(
 
     let mut best = -INFINITY;
     let mut best_move = None;
-    let mut first_move = true;
+    let mut legal_moves_searched = 0;
     for mv in moves {
+        let quiet = is_quiet(board, mv);
+        let tt_move = entry.and_then(|stored| stored.best_move) == Some(mv);
         let undo = board
             .make_move_unchecked(mv)
             .expect("legal move must be structurally valid");
@@ -389,37 +405,69 @@ fn negamax(
             board.unmake_move(undo);
             continue;
         }
+        let move_number = legal_moves_searched + 1;
+        let gives_check = quiet && board.is_in_check(board.side_to_move());
         let mut child_pv = PvLine::default();
-        let child = if first_move {
+        let child = if legal_moves_searched == 0 {
             negamax(board, depth - 1, node.child(true), -beta, -alpha, search, &mut child_pv).map(|score| -score)
         } else {
-            negamax(
+            let reduction = if can_late_move_reduce(depth, ply, move_number, in_check, gives_check, quiet, tt_move) {
+                adjusted_lmr_reduction(
+                    depth,
+                    move_number,
+                    is_pv_node(alpha, beta),
+                    search.history.score(side_to_move, mv),
+                )
+            } else {
+                0
+            };
+            #[cfg(test)]
+            if reduction > 0 {
+                search.context.lmr_reductions += 1;
+            }
+
+            let mut score = negamax(
                 board,
-                depth - 1,
+                depth - 1 - reduction,
                 node.child(true),
                 -alpha - 1,
                 -alpha,
                 search,
                 &mut child_pv,
             )
-            .map(|score| -score)
-            .and_then(|score| {
-                if score > alpha && score < beta {
-                    child_pv = PvLine::default();
-                    #[cfg(test)]
-                    {
-                        search.context.pvs_researches += 1;
-                    }
-                    negamax(board, depth - 1, node.child(true), -beta, -alpha, search, &mut child_pv)
-                        .map(|score| -score)
-                } else {
-                    Ok(score)
+            .map(|score| -score)?;
+
+            if reduction > 0 && score > alpha {
+                child_pv = PvLine::default();
+                #[cfg(test)]
+                {
+                    search.context.lmr_researches += 1;
                 }
-            })
+                score = -negamax(
+                    board,
+                    depth - 1,
+                    node.child(true),
+                    -alpha - 1,
+                    -alpha,
+                    search,
+                    &mut child_pv,
+                )?;
+            }
+
+            if score > alpha && score < beta {
+                child_pv = PvLine::default();
+                #[cfg(test)]
+                {
+                    search.context.pvs_researches += 1;
+                }
+                negamax(board, depth - 1, node.child(true), -beta, -alpha, search, &mut child_pv).map(|score| -score)
+            } else {
+                Ok(score)
+            }
         };
         board.unmake_move(undo);
         let score = child?;
-        first_move = false;
+        legal_moves_searched += 1;
 
         if score > best {
             best = score;
@@ -430,7 +478,7 @@ fn negamax(
             pv.prepend(mv, &child_pv);
         }
         if alpha >= beta {
-            if is_quiet(board, mv) {
+            if quiet {
                 search.history.reward(side_to_move, mv, depth);
             }
             break;
@@ -593,6 +641,49 @@ fn has_non_pawn_material(board: &Board, color: Color) -> bool {
         .any(|kind| board.colored_pieces(color, kind) != 0)
 }
 
+fn can_late_move_reduce(
+    depth: u8,
+    ply: usize,
+    move_number: usize,
+    in_check: bool,
+    gives_check: bool,
+    quiet: bool,
+    tt_move: bool,
+) -> bool {
+    ply > 0
+        && depth >= LMR_MIN_DEPTH
+        && move_number >= LMR_MIN_MOVE_NUMBER
+        && !in_check
+        && !gives_check
+        && quiet
+        && !tt_move
+}
+
+fn adjusted_lmr_reduction(depth: u8, move_number: usize, pv_node: bool, history_score: i32) -> u8 {
+    let mut reduction = base_lmr_reduction(depth, move_number).min(depth.saturating_sub(2));
+    if pv_node {
+        reduction = reduction.saturating_sub(1);
+    }
+    if history_score >= LMR_HIGH_HISTORY_THRESHOLD {
+        reduction = reduction.saturating_sub(1);
+    }
+    reduction
+}
+
+fn base_lmr_reduction(depth: u8, move_number: usize) -> u8 {
+    if depth < LMR_MIN_DEPTH || move_number < LMR_MIN_MOVE_NUMBER {
+        return 0;
+    }
+
+    let depth = usize::from(depth).min(LMR_MAX_DEPTH_INDEX) as f64;
+    let move_number = move_number.min(LMR_MAX_MOVE_INDEX) as f64;
+    ((depth.ln() * move_number.ln() / LMR_DIVISOR).floor() as u8).max(1)
+}
+
+const fn is_pv_node(alpha: i32, beta: i32) -> bool {
+    beta > alpha + 1
+}
+
 fn tt_cutoff(entry: Entry, depth: u8, ply: usize, alpha: i32, beta: i32) -> Option<i32> {
     if entry.depth < depth {
         return None;
@@ -686,6 +777,8 @@ mod tests {
                 aspiration_researches: 0,
                 rfp_prunes: 0,
                 nmp_prunes: 0,
+                lmr_reductions: 0,
+                lmr_researches: 0,
             },
             table: TranspositionTable::new(64 * 1024),
             history: ButterflyHistory::default(),
@@ -896,6 +989,52 @@ mod tests {
             evaluation::evaluate(&pawns),
             true,
         ));
+    }
+
+    #[test]
+    fn lmr_uses_log_formula_with_conservative_adjustments() {
+        let baseline = adjusted_lmr_reduction(6, 8, false, 0);
+        let deeper_later = adjusted_lmr_reduction(10, 32, false, 0);
+
+        assert_eq!(adjusted_lmr_reduction(2, 8, false, 0), 0);
+        assert_eq!(adjusted_lmr_reduction(6, 3, false, 0), 0);
+        assert!(baseline > 0);
+        assert!(deeper_later > baseline);
+        assert!(adjusted_lmr_reduction(10, 32, true, 0) < deeper_later);
+        assert!(adjusted_lmr_reduction(10, 32, false, HISTORY_MAX) < deeper_later);
+    }
+
+    #[test]
+    fn lmr_reduction_guards_tactical_and_sensitive_moves() {
+        assert!(!can_late_move_reduce(6, 0, 8, false, false, true, false));
+        assert!(!can_late_move_reduce(2, 1, 8, false, false, true, false));
+        assert!(!can_late_move_reduce(6, 1, 3, false, false, true, false));
+        assert!(!can_late_move_reduce(6, 1, 8, true, false, true, false));
+        assert!(!can_late_move_reduce(6, 1, 8, false, true, true, false));
+        assert!(!can_late_move_reduce(6, 1, 8, false, false, false, false));
+        assert!(!can_late_move_reduce(6, 1, 8, false, false, true, true));
+        assert!(can_late_move_reduce(6, 1, 8, false, false, true, false));
+    }
+
+    #[test]
+    fn lmr_reduces_late_quiet_moves_in_search() {
+        let mut board = Board::starting_position();
+        let stop = AtomicBool::new(false);
+        let mut search = unlimited_search(&stop);
+        let mut pv = PvLine::default();
+
+        negamax(
+            &mut board,
+            5,
+            NodeState::new(0, true),
+            -INFINITY,
+            INFINITY,
+            &mut search,
+            &mut pv,
+        )
+        .unwrap();
+
+        assert!(search.context.lmr_reductions > 0);
     }
 
     #[test]
