@@ -27,6 +27,7 @@ const LMR_MAX_DEPTH_INDEX: usize = MAX_PLY - 1;
 const LMR_MAX_MOVE_INDEX: usize = 255;
 const LMR_DIVISOR: f64 = 2.25;
 const LMR_HIGH_HISTORY_THRESHOLD: i32 = HISTORY_MAX / 4;
+const KILLER_SLOTS: usize = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SearchLimits {
@@ -140,6 +141,7 @@ struct SearchState<'a> {
     context: SearchContext<'a>,
     table: TranspositionTable,
     history: ButterflyHistory,
+    killers: KillerMoves,
 }
 
 struct ButterflyHistory {
@@ -164,6 +166,45 @@ impl ButterflyHistory {
         let bonus = (depth * depth).min(HISTORY_MAX);
         let entry = &mut self.scores[color.index()][mv.from().index()][mv.to().index()];
         *entry += bonus - *entry * bonus / HISTORY_MAX;
+    }
+}
+
+#[derive(Clone)]
+struct KillerMoves {
+    moves: [[Option<Move>; KILLER_SLOTS]; MAX_PLY],
+}
+
+impl Default for KillerMoves {
+    fn default() -> Self {
+        Self {
+            moves: [[None; KILLER_SLOTS]; MAX_PLY],
+        }
+    }
+}
+
+impl KillerMoves {
+    fn score(&self, ply: usize, mv: Move) -> i32 {
+        let Some(killers) = self.moves.get(ply) else {
+            return 0;
+        };
+        killers
+            .iter()
+            .position(|&killer| killer == Some(mv))
+            .map_or(0, |slot| (KILLER_SLOTS - slot) as i32)
+    }
+
+    fn add(&mut self, ply: usize, mv: Move) {
+        let Some(killers) = self.moves.get_mut(ply) else {
+            return;
+        };
+        if killers[0] == Some(mv) {
+            return;
+        }
+
+        for slot in (1..KILLER_SLOTS).rev() {
+            killers[slot] = killers[slot - 1];
+        }
+        killers[0] = Some(mv);
     }
 }
 
@@ -227,6 +268,7 @@ pub fn iterative_deepening(
         },
         table,
         history: ButterflyHistory::default(),
+        killers: KillerMoves::default(),
     };
     let mut outcome = SearchOutcome {
         best_move: fallback,
@@ -390,6 +432,8 @@ fn negamax(
         &mut moves,
         entry.and_then(|stored| stored.best_move),
         &search.history,
+        &search.killers,
+        ply,
     );
 
     let mut best = -INFINITY;
@@ -479,6 +523,9 @@ fn negamax(
         }
         if alpha >= beta {
             if quiet {
+                if ply > 0 {
+                    search.killers.add(ply, mv);
+                }
                 search.history.reward(side_to_move, mv, depth);
             }
             break;
@@ -553,6 +600,8 @@ fn quiescence(
         &mut moves,
         entry.and_then(|stored| stored.best_move),
         &search.history,
+        &search.killers,
+        ply,
     );
     for mv in moves {
         let undo = board
@@ -707,16 +756,27 @@ fn classify_bound(score: i32, alpha: i32, beta: i32) -> Bound {
     }
 }
 
-fn order_moves(board: &Board, moves: &mut [Move], tt_move: Option<Move>, history: &ButterflyHistory) {
+fn order_moves(
+    board: &Board,
+    moves: &mut [Move],
+    tt_move: Option<Move>,
+    history: &ButterflyHistory,
+    killers: &KillerMoves,
+    ply: usize,
+) {
     let color = board.side_to_move();
     moves.sort_by_key(|&mv| {
         let capture_score = mvv_lva_score(board, mv);
-        let history_score = if is_quiet(board, mv) {
-            history.score(color, mv)
-        } else {
-            0
-        };
-        std::cmp::Reverse((Some(mv) == tt_move, capture_score > 0, capture_score, history_score))
+        let quiet = mv.promotion().is_none() && capture_score == 0;
+        let killer_score = if quiet { killers.score(ply, mv) } else { 0 };
+        let history_score = if quiet { history.score(color, mv) } else { 0 };
+        std::cmp::Reverse((
+            Some(mv) == tt_move,
+            capture_score > 0,
+            capture_score,
+            killer_score,
+            history_score,
+        ))
     });
 }
 
@@ -782,6 +842,7 @@ mod tests {
             },
             table: TranspositionTable::new(64 * 1024),
             history: ButterflyHistory::default(),
+            killers: KillerMoves::default(),
         }
     }
 
@@ -1038,6 +1099,41 @@ mod tests {
     }
 
     #[test]
+    fn killer_moves_keep_two_recent_quiet_cutoffs_per_ply() {
+        let a3 = Move::new("a2".parse().unwrap(), "a3".parse().unwrap());
+        let b3 = Move::new("b2".parse().unwrap(), "b3".parse().unwrap());
+        let c3 = Move::new("c2".parse().unwrap(), "c3".parse().unwrap());
+        let mut killers = KillerMoves::default();
+
+        killers.add(4, a3);
+        killers.add(4, b3);
+        killers.add(4, b3);
+        assert_eq!(killers.score(4, b3), 2);
+        assert_eq!(killers.score(4, a3), 1);
+
+        killers.add(4, c3);
+        assert_eq!(killers.score(4, c3), 2);
+        assert_eq!(killers.score(4, b3), 1);
+        assert_eq!(killers.score(4, a3), 0);
+    }
+
+    #[test]
+    fn killer_moves_are_recorded_on_quiet_non_root_cutoffs() {
+        let mut board = Board::from_fen("4k3/8/8/8/8/8/4Q3/4K3 w - - 0 1").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut search = unlimited_search(&stop);
+        let mut pv = PvLine::default();
+
+        let score = negamax(&mut board, 5, NodeState::new(1, false), -50, 50, &mut search, &mut pv).unwrap();
+
+        assert!(score > 50);
+        assert!(
+            search.killers.moves.iter().flatten().any(Option::is_some),
+            "quiet fail-high did not record a killer move"
+        );
+    }
+
+    #[test]
     fn pvs_researches_a_later_move_that_improves_alpha() {
         let mut board = Board::starting_position();
         let stop = AtomicBool::new(false);
@@ -1129,11 +1225,12 @@ mod tests {
         let mut moves = [quiet, queen_takes_rook, queen_takes_queen, pawn_takes_queen];
 
         let history = ButterflyHistory::default();
-        order_moves(&board, &mut moves, None, &history);
+        let killers = KillerMoves::default();
+        order_moves(&board, &mut moves, None, &history, &killers, 0);
 
         assert_eq!(moves, [pawn_takes_queen, queen_takes_queen, queen_takes_rook, quiet]);
 
-        order_moves(&board, &mut moves, Some(quiet), &history);
+        order_moves(&board, &mut moves, Some(quiet), &history, &killers, 0);
         assert_eq!(moves, [quiet, pawn_takes_queen, queen_takes_queen, queen_takes_rook]);
     }
 
@@ -1146,9 +1243,28 @@ mod tests {
         history.reward(Color::White, nc3, 6);
         let mut moves = [a3, nc3];
 
-        order_moves(&board, &mut moves, None, &history);
+        order_moves(&board, &mut moves, None, &history, &KillerMoves::default(), 0);
 
         assert_eq!(moves, [nc3, a3]);
+    }
+
+    #[test]
+    fn killer_quiets_order_before_history_quiets_but_after_captures() {
+        let board = Board::from_fen("k7/8/8/3q4/4P3/8/8/K7 w - - 0 1").unwrap();
+        let capture = Move::new("e4".parse().unwrap(), "d5".parse().unwrap());
+        let killer_quiet = Move::new("e4".parse().unwrap(), "e5".parse().unwrap());
+        let history_quiet = Move::new("a1".parse().unwrap(), "b1".parse().unwrap());
+        let mut history = ButterflyHistory::default();
+        let mut killers = KillerMoves::default();
+        for _ in 0..1_000 {
+            history.reward(Color::White, history_quiet, 127);
+        }
+        killers.add(3, killer_quiet);
+        let mut moves = [history_quiet, killer_quiet, capture];
+
+        order_moves(&board, &mut moves, None, &history, &killers, 3);
+
+        assert_eq!(moves, [capture, killer_quiet, history_quiet]);
     }
 
     #[test]
@@ -1162,7 +1278,7 @@ mod tests {
         }
         let mut moves = [quiet, capture];
 
-        order_moves(&board, &mut moves, None, &history);
+        order_moves(&board, &mut moves, None, &history, &KillerMoves::default(), 0);
 
         assert_eq!(moves, [capture, quiet]);
     }
