@@ -28,6 +28,8 @@ const LMR_MAX_MOVE_INDEX: usize = 255;
 const LMR_DIVISOR: f64 = 2.25;
 const LMR_HIGH_HISTORY_THRESHOLD: i32 = HISTORY_MAX / 4;
 const KILLER_SLOTS: usize = 2;
+const LMP_MAX_DEPTH: u8 = 4;
+const LMP_HIGH_HISTORY_THRESHOLD: i32 = HISTORY_MAX / 8;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SearchLimits {
@@ -115,6 +117,8 @@ struct SearchContext<'a> {
     lmr_reductions: u64,
     #[cfg(test)]
     lmr_researches: u64,
+    #[cfg(test)]
+    lmp_prunes: u64,
 }
 
 impl SearchContext<'_> {
@@ -265,6 +269,8 @@ pub fn iterative_deepening(
             lmr_reductions: 0,
             #[cfg(test)]
             lmr_researches: 0,
+            #[cfg(test)]
+            lmp_prunes: 0,
         },
         table,
         history: ButterflyHistory::default(),
@@ -442,6 +448,12 @@ fn negamax(
     for mv in moves {
         let quiet = is_quiet(board, mv);
         let tt_move = entry.and_then(|stored| stored.best_move) == Some(mv);
+        let killer_score = if quiet { search.killers.score(ply, mv) } else { 0 };
+        let history_score = if quiet {
+            search.history.score(side_to_move, mv)
+        } else {
+            0
+        };
         let undo = board
             .make_move_unchecked(mv)
             .expect("legal move must be structurally valid");
@@ -451,17 +463,33 @@ fn negamax(
         }
         let move_number = legal_moves_searched + 1;
         let gives_check = quiet && board.is_in_check(board.side_to_move());
+        if can_late_move_prune(LateMovePrune {
+            depth,
+            ply,
+            move_number,
+            alpha,
+            beta,
+            in_check,
+            gives_check,
+            quiet,
+            tt_move,
+            killer_score,
+            history_score,
+        }) {
+            board.unmake_move(undo);
+            legal_moves_searched += 1;
+            #[cfg(test)]
+            {
+                search.context.lmp_prunes += 1;
+            }
+            continue;
+        }
         let mut child_pv = PvLine::default();
         let child = if legal_moves_searched == 0 {
             negamax(board, depth - 1, node.child(true), -beta, -alpha, search, &mut child_pv).map(|score| -score)
         } else {
             let reduction = if can_late_move_reduce(depth, ply, move_number, in_check, gives_check, quiet, tt_move) {
-                adjusted_lmr_reduction(
-                    depth,
-                    move_number,
-                    is_pv_node(alpha, beta),
-                    search.history.score(side_to_move, mv),
-                )
+                adjusted_lmr_reduction(depth, move_number, is_pv_node(alpha, beta), history_score)
             } else {
                 0
             };
@@ -708,6 +736,39 @@ fn can_late_move_reduce(
         && !tt_move
 }
 
+#[derive(Clone, Copy)]
+struct LateMovePrune {
+    depth: u8,
+    ply: usize,
+    move_number: usize,
+    alpha: i32,
+    beta: i32,
+    in_check: bool,
+    gives_check: bool,
+    quiet: bool,
+    tt_move: bool,
+    killer_score: i32,
+    history_score: i32,
+}
+
+fn can_late_move_prune(condition: LateMovePrune) -> bool {
+    condition.ply > 0
+        && condition.depth <= LMP_MAX_DEPTH
+        && condition.move_number > lmp_move_limit(condition.depth)
+        && !is_pv_node(condition.alpha, condition.beta)
+        && !condition.in_check
+        && !condition.gives_check
+        && condition.quiet
+        && !condition.tt_move
+        && condition.killer_score == 0
+        && condition.history_score < LMP_HIGH_HISTORY_THRESHOLD
+}
+
+fn lmp_move_limit(depth: u8) -> usize {
+    let depth = usize::from(depth);
+    3 + depth * depth + 2 * depth
+}
+
 fn adjusted_lmr_reduction(depth: u8, move_number: usize, pv_node: bool, history_score: i32) -> u8 {
     let mut reduction = base_lmr_reduction(depth, move_number).min(depth.saturating_sub(2));
     if pv_node {
@@ -839,6 +900,7 @@ mod tests {
                 nmp_prunes: 0,
                 lmr_reductions: 0,
                 lmr_researches: 0,
+                lmp_prunes: 0,
             },
             table: TranspositionTable::new(64 * 1024),
             history: ButterflyHistory::default(),
@@ -1078,6 +1140,70 @@ mod tests {
     }
 
     #[test]
+    fn lmp_uses_conservative_move_limits() {
+        assert_eq!(lmp_move_limit(1), 6);
+        assert_eq!(lmp_move_limit(2), 11);
+        assert_eq!(lmp_move_limit(3), 18);
+        assert_eq!(lmp_move_limit(4), 27);
+    }
+
+    #[test]
+    fn lmp_pruning_guards_tactical_and_sensitive_moves() {
+        let depth = 3;
+        let late_move = lmp_move_limit(depth) + 1;
+        let pruneable = LateMovePrune {
+            depth,
+            ply: 1,
+            move_number: late_move,
+            alpha: 0,
+            beta: 1,
+            in_check: false,
+            gives_check: false,
+            quiet: true,
+            tt_move: false,
+            killer_score: 0,
+            history_score: 0,
+        };
+
+        assert!(!can_late_move_prune(LateMovePrune { ply: 0, ..pruneable }));
+        assert!(!can_late_move_prune(LateMovePrune { depth: 5, ..pruneable }));
+        assert!(!can_late_move_prune(LateMovePrune {
+            move_number: lmp_move_limit(depth),
+            ..pruneable
+        }));
+        assert!(!can_late_move_prune(LateMovePrune {
+            alpha: -100,
+            beta: 100,
+            ..pruneable
+        }));
+        assert!(!can_late_move_prune(LateMovePrune {
+            in_check: true,
+            ..pruneable
+        }));
+        assert!(!can_late_move_prune(LateMovePrune {
+            gives_check: true,
+            ..pruneable
+        }));
+        assert!(!can_late_move_prune(LateMovePrune {
+            quiet: false,
+            ..pruneable
+        }));
+        assert!(!can_late_move_prune(LateMovePrune {
+            tt_move: true,
+            ..pruneable
+        }));
+        assert!(!can_late_move_prune(LateMovePrune {
+            killer_score: 1,
+            ..pruneable
+        }));
+        assert!(!can_late_move_prune(LateMovePrune {
+            history_score: LMP_HIGH_HISTORY_THRESHOLD,
+            ..pruneable
+        }));
+        assert!(can_late_move_prune(pruneable));
+    }
+
+    #[test]
     fn lmr_reduces_late_quiet_moves_in_search() {
         let mut board = Board::starting_position();
         let stop = AtomicBool::new(false);
@@ -1096,6 +1222,27 @@ mod tests {
         .unwrap();
 
         assert!(search.context.lmr_reductions > 0);
+    }
+
+    #[test]
+    fn lmp_prunes_late_quiet_moves_in_search() {
+        let mut board = Board::starting_position();
+        let stop = AtomicBool::new(false);
+        let mut search = unlimited_search(&stop);
+        let mut pv = PvLine::default();
+
+        negamax(
+            &mut board,
+            5,
+            NodeState::new(0, true),
+            -INFINITY,
+            INFINITY,
+            &mut search,
+            &mut pv,
+        )
+        .unwrap();
+
+        assert!(search.context.lmp_prunes > 0);
     }
 
     #[test]

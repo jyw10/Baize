@@ -389,7 +389,7 @@ mod tests {
         engine.stop_search();
 
         let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
-        assert!(text.contains("id name Baize-v0.14.0\n"));
+        assert!(text.contains("id name Baize-v0.15.0\n"));
         assert!(text.contains("option name Hash type spin default 16 min 1 max 65536\n"));
         assert!(text.contains("uciok\n"));
         assert!(text.contains("readyok\n"));
